@@ -15,7 +15,7 @@ param(
     [string]$Destination,
     [switch]$ReleaseSource, [switch]$Rollback, [switch]$Status, [string]$Id, [string]$ResumeId,
     [switch]$Worker, [ValidateSet('Move','Release','Rollback')][string]$Operation='Move', [switch]$Foreground, [string]$WorkerToken,
-    [switch]$VerifyHash, [string]$ResultPath,
+    [switch]$VerifyHash, [string]$ResultPath, [string]$LogDirectory,
     [string]$OriginalUserSid, [string]$OriginalUserProfile, [switch]$ElevatedChild
 )
 Set-StrictMode -Version 2.0
@@ -1003,6 +1003,7 @@ function Invoke-MoveElevatedChild {
     $hostPath=(Get-Process -Id $PID).Path
     $child=@{};foreach ($key in $Arguments.Keys) {$child[$key]=$Arguments[$key]}
     $child.ElevatedChild=$true;$child.OriginalUserSid=$script:MigrationSid;$child.OriginalUserProfile=$script:MigrationProfile;$child.ResultPath=$OutputPath
+    $child.LogDirectory=Split-Path -Path $script:MigrationContext.LogPath -Parent
     $parts=Get-MoveHostArguments $Script $child
     try {
         $null=Start-Process -FilePath $hostPath -ArgumentList (@($parts | ForEach-Object {ConvertTo-CleanerNativeArgument $_}) -join ' ') -Verb RunAs -Wait -PassThru -ErrorAction Stop
@@ -1296,6 +1297,7 @@ function Start-MoveWorker {
         }
         $token=[guid]::NewGuid().ToString('N')
         $startArgs=@{Worker=$true;WorkerToken=$token;Id=$Record.Id;Operation=$Operation;OriginalUserSid=$script:MigrationSid;OriginalUserProfile=$script:MigrationProfile}
+        $startArgs.LogDirectory=Split-Path -Path $script:MigrationContext.LogPath -Parent
         $parts=Get-MoveHostArguments $script:MoveScriptPath $startArgs
         $process=Start-Process -FilePath ((Get-Process -Id $PID).Path) -ArgumentList (@($parts | ForEach-Object {ConvertTo-CleanerNativeArgument $_}) -join ' ') -WindowStyle Hidden -PassThru -ErrorAction Stop
         $snapshot=[pscustomobject]@{Schema='pc-care/move-status/1';RunToken=$token;Id=$Record.Id;Operation=$Operation;Phase=$Record.State;FilesDone=[long]0;BytesDone=[long]0;TotalFiles=[long]0;TotalBytes=$Record.TotalBytes;LastUpdate=[datetimeoffset]::UtcNow.ToString('o');WorkerPid=$process.Id;WorkerStartTime=$process.StartTime.ToUniversalTime().ToString('o');FinalResultPath=''}
@@ -1330,6 +1332,9 @@ function Invoke-MoveMain {
     Import-MoveMigrationFunctions (Join-Path $Root 'migrate.ps1')
     $contextArgs=@{}
     if ($Arguments.OriginalUserSid) {$contextArgs.OriginalUserSid=$Arguments.OriginalUserSid;$contextArgs.OriginalUserProfile=$Arguments.OriginalUserProfile}
+    $logDirectory=[string](Get-MigrationValue $Arguments @('LogDirectory') '')
+    if (($Arguments.Worker -or $Arguments.ElevatedChild) -and -not $logDirectory) {throw '没有收到原账户的记录目录，已停止搬家。'}
+    if ($logDirectory) {$contextArgs.LogDirectory=$logDirectory}
     $script:MigrationContext=Get-CleanerContext @contextArgs
     $script:MigrationSid=$script:MigrationContext.OriginalUserSid;$script:MigrationProfile=$script:MigrationContext.OriginalUserProfile
     $script:MigrationLog=$script:MigrationContext.LogPath;$script:MigrationCmdlet=$script:MoveCmdlet;$script:MigrationWroteState=(-not $WhatIfPreference)
@@ -1449,5 +1454,5 @@ function Assert-MoveRequest {
 }
 
 $script:MoveCmdlet=$PSCmdlet
-$arguments=@{Kind=$Kind;Folder=$Folder;Destination=$Destination;ReleaseSource=[bool]$ReleaseSource;Rollback=[bool]$Rollback;Status=[bool]$Status;Worker=[bool]$Worker;Operation=$Operation;Foreground=[bool]$Foreground;WorkerToken=$WorkerToken;Id=$Id;ResumeId=$ResumeId;VerifyHash=[bool]$VerifyHash;ResultPath=$ResultPath;OriginalUserSid=$OriginalUserSid;OriginalUserProfile=$OriginalUserProfile;ElevatedChild=[bool]$ElevatedChild}
+$arguments=@{Kind=$Kind;Folder=$Folder;Destination=$Destination;ReleaseSource=[bool]$ReleaseSource;Rollback=[bool]$Rollback;Status=[bool]$Status;Worker=[bool]$Worker;Operation=$Operation;Foreground=[bool]$Foreground;WorkerToken=$WorkerToken;Id=$Id;ResumeId=$ResumeId;VerifyHash=[bool]$VerifyHash;ResultPath=$ResultPath;LogDirectory=$LogDirectory;OriginalUserSid=$OriginalUserSid;OriginalUserProfile=$OriginalUserProfile;ElevatedChild=[bool]$ElevatedChild}
 if ($Status -or $WhatIfPreference -or $PSCmdlet.ShouldProcess('用户资料','搬家并保留原件，或执行已指定的还原/释放操作')) {Invoke-MoveMain $arguments $PSScriptRoot $PSCommandPath}

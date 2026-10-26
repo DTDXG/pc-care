@@ -41,9 +41,9 @@ function Get-CleanerNativeType {
     param()
     if ($null -ne $script:CleanerNativeType) { return $script:CleanerNativeType }
     if (-not (Test-CleanerWindows)) { throw '此安全库仅支持 Windows。' }
-    $existing = 'CDriveCleaner.NativeV4' -as [type]
+    $existing = 'CDriveCleaner.NativeV5' -as [type]
     if ($null -ne $existing) { $script:CleanerNativeType = $existing; return $existing }
-    $name = [Reflection.AssemblyName]::new('CDriveCleaner.NativeV4')
+    $name = [Reflection.AssemblyName]::new('CDriveCleaner.NativeV5')
     if ($null -ne [Reflection.Emit.AssemblyBuilder].GetMethod('DefineDynamicAssembly', [type[]]@([Reflection.AssemblyName], [Reflection.Emit.AssemblyBuilderAccess]))) {
         $assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::Run)
     }
@@ -51,8 +51,9 @@ function Get-CleanerNativeType {
         $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($name, [Reflection.Emit.AssemblyBuilderAccess]::Run)
     }
     $module = $assembly.DefineDynamicModule('Native')
-    $builder = $module.DefineType('CDriveCleaner.NativeV4', [Reflection.TypeAttributes]'Public, Abstract, Sealed')
+    $builder = $module.DefineType('CDriveCleaner.NativeV5', [Reflection.TypeAttributes]'Public, Abstract, Sealed')
     $definitions = @(
+        @{ Name = 'GetCurrentPackageFamilyName'; Return = [int]; Parameters = [type[]]@([uint32].MakeByRefType(), [Text.StringBuilder]) }
         @{ Name = 'GetVolumeNameForVolumeMountPointW'; Return = [bool]; Parameters = [type[]]@([string], [Text.StringBuilder], [uint32]) }
         @{ Name = 'GetLongPathNameW'; Return = [uint32]; Parameters = [type[]]@([string], [Text.StringBuilder], [uint32]) }
         @{ Name = 'CreateFileW'; Return = [Microsoft.Win32.SafeHandles.SafeFileHandle]; Parameters = [type[]]@([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr]) }
@@ -289,6 +290,104 @@ function Test-CleanerOriginalUserIdentity {
     return Test-CleanerInteractiveUser -UserSid $OriginalUserSid
 }
 
+function Test-CleanerPackageFamilyName {
+    param([AllowEmptyString()][string]$PackageFamilyName)
+    return ($PackageFamilyName -cmatch '\A[A-Za-z0-9.-]+_[A-Za-z0-9.-]+\z' -and
+        -not $PackageFamilyName.Contains('..'))
+}
+
+function Get-CleanerLogBase {
+    # 纯路径选择；显式 LocalCache 位置避免打包进程的 AppData 写入重定向。
+    param([string]$LocalAppData, [AllowEmptyString()][string]$PackageFamilyName)
+    $base = $LocalAppData.TrimEnd([char]'\')
+    if (Test-CleanerPackageFamilyName $PackageFamilyName) {
+        $base += '\Packages\' + $PackageFamilyName + '\LocalCache\Local'
+    }
+    return $base + '\CDriveCleaner\Logs'
+}
+
+function Get-CleanerPackageFamilyName {
+    # API 返回错误码本身；不要读取 GetLastWin32Error。失败仅影响默认路径选择。
+    $family = ''; $diagnostic = ''
+    try {
+        $native = Get-CleanerNativeType
+        [uint32]$length = 0
+        $code = $native::GetCurrentPackageFamilyName([ref]$length, $null)
+        for ($attempt = 0; $code -eq 122 -and $attempt -lt 3; $attempt++) {
+            if ($length -eq 0 -or $length -gt 32768) { throw '应用包名称长度无效。' }
+            $buffer = [Text.StringBuilder]::new([int]$length)
+            $code = $native::GetCurrentPackageFamilyName([ref]$length, $buffer)
+            if ($code -eq 0) { $family = $buffer.ToString() }
+        }
+        if ($code -ne 0 -and $code -ne 15700) {
+            throw [ComponentModel.Win32Exception]::new([int]$code)
+        }
+        if ($code -eq 0 -and -not (Test-CleanerPackageFamilyName $family)) {
+            $family = ''; $diagnostic = '应用包名称格式无效。'
+        }
+    }
+    catch { $family = ''; $diagnostic = $_.Exception.Message }
+    return [pscustomobject]@{ FamilyName = $family; Error = $diagnostic }
+}
+
+function Set-CleanerContextLogPath {
+    # 单独保留默认/参数/环境优先级，便于不调用 Windows 身份 API 的测试。
+    param($Context, [string]$LogPath)
+    $diagnostic = ''
+    if (-not $LogPath) { $LogPath = [Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH') }
+    if (-not $LogPath) {
+        $package = Get-CleanerPackageFamilyName
+        $diagnostic = $package.Error
+        $base = Get-CleanerLogBase -LocalAppData $Context.Variables.LOCALAPPDATA -PackageFamilyName $package.FamilyName
+        $LogPath = $base + '\cleaner-' + [guid]::NewGuid().ToString('N') + '.jsonl'
+    }
+    $Context.LogPath = ConvertTo-CleanerCanonicalPath -LiteralPath $LogPath
+    $Context | Add-Member -NotePropertyName PackageIdentityDiagnostic -NotePropertyValue $diagnostic -Force
+}
+
+function Assert-CleanerLogDirectory {
+    # 只接受原用户 LocalAppData 下两种精确形状；不能借日志参数授权其他 Packages 目录。
+    param([string]$LogDirectory, $Context)
+    try {
+        $directory = ConvertTo-CleanerCanonicalPath -LiteralPath $LogDirectory
+        $local = ConvertTo-CleanerCanonicalPath -LiteralPath $Context.Variables.LOCALAPPDATA
+        $profile = ConvertTo-CleanerCanonicalPath -LiteralPath $Context.OriginalUserProfile
+        if (-not $directory.StartsWith(($profile + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw '记录目录必须位于原账户的用户文件夹内。' }
+        $plain = Get-CleanerLogBase $local ''
+        if (-not $directory.Equals($plain, [StringComparison]::OrdinalIgnoreCase)) {
+            $prefix = $local + '\Packages\'
+            $suffix = '\LocalCache\Local\CDriveCleaner\Logs'
+            if (-not $directory.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
+                -not $directory.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase) -or
+                $directory.Length -le ($prefix.Length + $suffix.Length)) { throw '记录目录格式不正确。' }
+            $family = $directory.Substring($prefix.Length, $directory.Length - $prefix.Length - $suffix.Length)
+            if (-not (Test-CleanerPackageFamilyName $family)) { throw '记录目录格式不正确。' }
+        }
+        $reason = Get-CleanerForbiddenReason -LiteralPath $directory -Context $Context
+        if ($reason) { throw '记录目录位于受保护的位置。' }
+        return $directory
+    }
+    catch { throw '记录目录不安全，请使用原账户的清理记录文件夹。' }
+}
+
+function Set-CleanerChildLogDirectory {
+    param([string]$LogDirectory, $Context)
+    $directory = Assert-CleanerLogDirectory -LogDirectory $LogDirectory -Context $Context
+    # 子进程始终使用新文件，绝不沿用父进程文件或继承的 CLEANER_LOG_PATH。
+    $log = $directory + '\cleaner-' + [guid]::NewGuid().ToString('N') + '.jsonl'
+    $check = Test-CleanerPathChain -LiteralPath $log -AllowMissing
+    if (-not $check.IsSafe) { throw '记录目录无法安全使用，请回到原账户重新运行。' }
+    $Context.LogPath = $log
+}
+
+function New-CleanerPathException {
+    param([string]$Reason, [string]$RequestedPath, [string]$FinalPath)
+    $exception = [IO.IOException]::new($Reason)
+    $exception.Data['RequestedPath'] = $RequestedPath
+    $exception.Data['FinalPath'] = $FinalPath
+    return $exception
+}
+
 function Get-CleanerContext {
     <#
     .SYNOPSIS
@@ -302,6 +401,8 @@ function Get-CleanerContext {
         提权前记录的原用户目录。别名 UserProfile。
     .PARAMETER LogPath
         可选 JSONL 日志绝对路径；默认位于原用户 LocalAppData 下。
+    .PARAMETER LogDirectory
+        子进程继承的记录目录；须在原用户目录内并符合普通或应用包日志目录形状，另建 JSONL 文件。
     .EXAMPLE
         $c = Get-CleanerContext -OriginalUserSid 'S-1-5-21-1-2-3-1001' -OriginalUserProfile 'C:\Users\张三'
     #>
@@ -309,7 +410,8 @@ function Get-CleanerContext {
     param(
         [Alias('UserSid')][string]$OriginalUserSid,
         [Alias('UserProfile')][string]$OriginalUserProfile,
-        [string]$LogPath
+        [string]$LogPath,
+        [string]$LogDirectory
     )
     if ($PSBoundParameters.Count -eq 0 -and $null -ne $script:CleanerContext) { return $script:CleanerContext }
     if (-not (Test-CleanerWindows)) { throw '此共享库仅供 Windows 使用。' }
@@ -443,11 +545,8 @@ function Get-CleanerContext {
         }
     }
     $context.SyncRoots = @($syncRoots.ToArray() | Select-Object -Unique)
-    if (-not $LogPath) { $LogPath = [Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH') }
-    if (-not $LogPath) {
-        $LogPath = [IO.Path]::Combine($variables.LOCALAPPDATA, ('CDriveCleaner\Logs\cleaner-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fffffff') + '-' + $PID + '.jsonl'))
-    }
-    $context.LogPath = ConvertTo-CleanerCanonicalPath -LiteralPath $LogPath
+    if ($PSBoundParameters.ContainsKey('LogDirectory')) { Set-CleanerChildLogDirectory -LogDirectory $LogDirectory -Context $context }
+    else { Set-CleanerContextLogPath -Context $context -LogPath $LogPath }
     $script:CleanerContext = $context
     return $context
 }
@@ -716,7 +815,7 @@ function Get-CleanerMigrationTarget {
         'AuditDirectory' {
             $log = ConvertTo-CleanerCanonicalPath -LiteralPath $Context.LogPath
             if ($log -notmatch '\.jsonl$') { throw '上下文审计日志必须是 .jsonl 文件。' }
-            $directory = $log.Substring(0, $log.LastIndexOf('\'))
+            $directory = Assert-CleanerLogDirectory -LogDirectory ($log.Substring(0, $log.LastIndexOf('\'))) -Context $Context
             # 必须是明确的审计目录，不能把用户/AppData/盘根当审计目录泛化授权。
             $reason = Get-CleanerForbiddenReason -LiteralPath $directory -Context $Context
             if ($reason) { throw $reason }
@@ -1038,7 +1137,7 @@ function Open-CleanerParentGuards {
             $metadata = Get-CleanerHandleMetadata -Handle $handle
             if (-not $metadata.IsDirectory) { throw '父路径不是目录。' }
             $final = Get-CleanerFinalHandlePath -Handle $handle
-            if (-not $final.Equals($directory, [StringComparison]::OrdinalIgnoreCase)) { throw '父目录最终路径发生变化或跨越卷别名。' }
+            if (-not $final.Equals($directory, [StringComparison]::OrdinalIgnoreCase)) { throw (New-CleanerPathException '父目录最终路径发生变化或跨越卷别名。' $directory $final) }
             $handle = $null
         }
         $result = [pscustomobject]@{ Handles = $handles }
@@ -1223,7 +1322,8 @@ function Write-CleanerLog {
         if ($handle.IsInvalid) { throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
         $metadata = Get-CleanerHandleMetadata -Handle $handle
         if ($metadata.IsDirectory -or $metadata.LinkCount -ne 1) { throw '日志必须是普通单链接文件。' }
-        if (-not (Get-CleanerFinalHandlePath -Handle $handle).Equals($check.Path, [StringComparison]::OrdinalIgnoreCase)) { throw '日志文件最终路径发生变化。' }
+        $final = Get-CleanerFinalHandlePath -Handle $handle
+        if (-not $final.Equals($check.Path, [StringComparison]::OrdinalIgnoreCase)) { throw (New-CleanerPathException '日志文件最终路径发生变化。' $check.Path $final) }
         $stream = [IO.FileStream]::new($handle, [IO.FileAccess]::Write)
         [void]$stream.Seek(0, [IO.SeekOrigin]::End)
         $bytesToWrite = [Text.UTF8Encoding]::new($false).GetBytes($line)

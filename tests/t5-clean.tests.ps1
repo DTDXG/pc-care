@@ -227,7 +227,7 @@ finally { $memory.Dispose() }
 function Invoke-TestAdmin {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([switch]$AdminPhase, [string]$ReportPath, [string[]]$AdminItemIds, [string]$ResultPath,
-        [string]$OriginalUserSid, [string]$OriginalUserProfile, [guid]$RequestId)
+        [string]$OriginalUserSid, [string]$OriginalUserProfile, [guid]$RequestId, [string]$LogDirectory)
     Assert-True $AdminPhase '内部管理员参数集'
     Assert-Equal $ReportPath "C:\报'告\checkup.json" '报告路径单引号不丢失'
     Assert-Equal $OriginalUserProfile $context.OriginalUserProfile '原用户目录尾部反斜线与引号保留'
@@ -317,6 +317,7 @@ function Invoke-TestHandler {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([string]$Category, [string]$Action, [switch]$AcknowledgeIrreversible, [string]$Mode,
         [string]$OriginalUserSid, [string]$OriginalUserProfile)
+    Assert-Equal ([Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH')) $context.LogPath '旧处理器继承当前进程已解析的日志路径'
     $script:events += ('handler:' + $Category + $Action)
     Write-Host '处理器的内部维护输出，不应显示给用户'
     Assert-True ($ConfirmPreference -eq 'None') '处理器不重复询问'
@@ -334,7 +335,9 @@ function Invoke-TestHandler {
 }
 $item = Get-CleanItemDefinition 'cache:UserTemp'
 $item | Add-Member -NotePropertyName HandlerPath -NotePropertyValue 'Invoke-TestHandler'
+$originalHandlerLog = [Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH')
 $captured = @(Invoke-CleanItem $item $context 6>&1)
+Assert-Equal ([Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH')) $originalHandlerLog '处理器成功后恢复原日志环境变量'
 Assert-Equal $captured.Count 1 '旧处理器内部主机输出被隐藏，输出只剩结果对象'
 $row = $captured[0]
 Assert-Equal $row.Status 'Done' '内存处理器正常结果'
@@ -348,6 +351,7 @@ Assert-True ($row.Reason -match '有 12 个文件') '捕获文件占用数'
 $item.Parameters.Category = 'Throw'
 $row = Invoke-CleanItem $item $context
 Assert-Equal $row.Status 'Failed' '有输出后抛错仍为失败'
+Assert-Equal ([Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH')) $originalHandlerLog '处理器异常后也恢复原日志环境变量'
 Assert-True ($row.Reason -match '文件正在被使用' -and $row.Reason -notmatch 'SID|C:\\') '保留输出中的跳过信息，异常使用普通中文'
 $systemItem = Get-CleanItemDefinition 'system:Hibernate'
 $systemItem | Add-Member -NotePropertyName HandlerPath -NotePropertyValue 'Invoke-TestHandler'
@@ -435,6 +439,42 @@ Assert-Equal @($script:events | Where-Object { $_ -eq 'uac' }).Count 0 '内部�
     $script:events = @()
     Assert-Rejected { Invoke-CleanCommand @mainArgs } '无法创建新的清理结果文件' '先确认结果可以保存，再开始清理'
     Assert-Equal @($script:events | Where-Object { $_ -like 'run:*' -or $_ -in @('uac', 'log', 'audit', 'write') }).Count 0 '创建结果失败没有执行清理或日志'
+}
+
+# 结果目录本身不可写时，仍经标准输出交付可解析的诊断，且绝不开始清理。
+& {
+    function New-CleanResultFile { param($Path, $Context); throw '模拟结果目录不可写' }
+    $script:events = @(); $messages = [Collections.Generic.List[string]]::new(); $reason = ''
+    try { Invoke-CleanCommand @mainArgs | ForEach-Object { $messages.Add([string]$_) } }
+    catch { $reason = $_.Exception.Message }
+    $failure = $messages[0] | ConvertFrom-Json
+    Assert-Equal $failure.Schema 'pc-care/clean/1' '结果无法保存仍使用原版本的 JSON'
+    Assert-Equal $failure.Diagnostics.Stage 'Clean/ResultFile' '结果创建失败保留阶段'
+    Assert-True ($failure.Diagnostics.RequestedPath -match 'clean-.*\.json$') '结果创建失败保留请求路径'
+    Assert-Equal $failure.Diagnostics.Reason '模拟结果目录不可写' '结果创建失败保留原始原因'
+    Assert-Equal $messages[-1] 'RESULT: 未保存' '不能冒充结果文件已保存'
+    Assert-True ($reason -match '无法创建新的清理结果文件') '用户错误仍是普通中文'
+    Assert-Equal @($script:events | Where-Object { $_ -like 'run:*' -or $_ -in @('uac', 'log', 'audit', 'write') }).Count 0 '无法创建结果不执行清理'
+}
+# 开始日志失败时诊断进入已保留的结果文件；最终路径差异供代理排查，不出现在用户原因里。
+& {
+    function Write-CleanerLog {
+        param($Action, $Path, $Result, $Context, $Message, $Confirm, $ErrorAction)
+        $exception = [IO.IOException]::new('模拟父目录最终路径不同')
+        $exception.Data['RequestedPath'] = 'C:\requested\Logs'
+        $exception.Data['FinalPath'] = 'C:\redirected\Logs'
+        throw $exception
+    }
+    $script:events = @()
+    Invoke-CleanCommand @mainArgs | Out-Null
+    Assert-Equal $script:written.Schema 'pc-care/clean/1' '诊断只增加字段，不改变版本'
+    Assert-Equal $script:written.Diagnostics.Stage 'Clean/StartLog' '开始日志失败保留阶段'
+    Assert-Equal $script:written.Diagnostics.RequestedPath 'C:\requested\Logs' '保留失败祖先的请求路径'
+    Assert-Equal $script:written.Diagnostics.FinalPath 'C:\redirected\Logs' '保留句柄最终路径'
+    Assert-Equal $script:written.Diagnostics.Reason '模拟父目录最终路径不同' '不吞掉开始日志异常'
+    Assert-True ($script:written.Items[0].Reason -match '清理记录无法完整保存' -and $script:written.Items[0].Reason -notmatch 'C:\\') '用户原因保持普通中文'
+    Assert-Equal @($script:events | Where-Object { $_ -like 'run:*' -or $_ -eq 'uac' }).Count 0 '开始日志失败绝不执行清理或提权'
+    Assert-True ($script:events -contains 'write' -and $script:events -contains 'close') '开始日志失败仍写结果并释放句柄'
 }
 
 Write-Host ('PASS t5-clean: {0} assertions; AST-only loading; in-memory fakes; no script body, Windows API, cleanup or child process executed.' -f $script:assertions)

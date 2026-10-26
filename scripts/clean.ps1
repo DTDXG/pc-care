@@ -15,6 +15,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ReportPath,
     [Parameter(ParameterSetName = 'Public')][string[]]$Include = @(),
     [string]$ResultPath,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Admin', DontShow = $true)][string]$LogDirectory,
     [Parameter(Mandatory = $true, ParameterSetName = 'Admin', DontShow = $true)][switch]$AdminPhase,
     [Parameter(Mandatory = $true, ParameterSetName = 'Admin', DontShow = $true)][string[]]$AdminItemIds,
     [Parameter(Mandatory = $true, ParameterSetName = 'Admin', DontShow = $true)][string]$OriginalUserSid,
@@ -271,12 +272,16 @@ function Invoke-CleanItem {
         $parameters.OriginalUserProfile = $Context.OriginalUserProfile
     }
     $failed = $false
+    $previousLog = [Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH')
     try {
+        # 旧处理器会重新载入 common.ps1；同进程调用也必须保留已解析的日志位置。
+        [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', $Context.LogPath)
         $handler = $Item.HandlerPath
         # 捕获错误与警告供普通中文汇总；隐藏旧处理器面向维护者的主机输出。
         & $handler @parameters -Confirm:$false -WhatIf:$false 2>&1 3>&1 4>$null 5>$null 6>$null | ForEach-Object { $records.Add($_) }
     }
     catch { $failed = $true; $records.Add($_) }
+    finally { [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', $previousLog) }
     $after = Get-CleanFreeBytes
     $outcome = Get-CleanOutcome $records.ToArray() $failed
     New-CleanItemResult $Item $outcome.Status $outcome.Reason (Get-CleanDelta $before $after) $before $after $watch.ElapsedMilliseconds
@@ -376,6 +381,7 @@ function New-CleanAdminCommand {
     $ids = @($Items | ForEach-Object { ConvertTo-CleanLiteral $_.Id }) -join ','
     $command = '& ' + (ConvertTo-CleanLiteral $ScriptPath) + ' -AdminPhase -ReportPath ' + (ConvertTo-CleanLiteral $ReportPath)
     $command += ' -AdminItemIds @(' + $ids + ') -ResultPath ' + (ConvertTo-CleanLiteral $ResultPath)
+    $command += ' -LogDirectory ' + (ConvertTo-CleanLiteral (Split-Path -Path $Context.LogPath -Parent))
     $command += ' -OriginalUserSid ' + (ConvertTo-CleanLiteral $Context.OriginalUserSid)
     $command += ' -OriginalUserProfile ' + (ConvertTo-CleanLiteral $Context.OriginalUserProfile)
     $command += ' -RequestId ' + (ConvertTo-CleanLiteral $RequestId.ToString()) + ' -Confirm:$false -WhatIf:$false'
@@ -518,18 +524,32 @@ function Format-CleanSummary {
     return $text
 }
 
+function Get-CleanFailureDiagnostics {
+    param([string]$Stage, [string]$RequestedPath, $Failure)
+    $final = $null
+    $exception = $Failure.Exception
+    while ($null -ne $exception) {
+        if ($exception.Data.Contains('RequestedPath')) { $RequestedPath = $exception.Data['RequestedPath'] }
+        if ($exception.Data.Contains('FinalPath')) { $final = $exception.Data['FinalPath'] }
+        $exception = $exception.InnerException
+    }
+    return @{ Stage = $Stage; RequestedPath = $RequestedPath; FinalPath = $final; Reason = $Failure.Exception.Message }
+}
+
 function Invoke-CleanCommand {
     param([string]$ReportPath, [string[]]$Include = @(), [string]$ResultPath,
         [bool]$AdminPhase = $false, [string[]]$AdminItemIds = @(), [string]$OriginalUserSid,
-        [string]$OriginalUserProfile, [guid]$RequestId = [guid]::Empty,
+        [string]$OriginalUserProfile, [guid]$RequestId = [guid]::Empty, [string]$LogDirectory,
         [bool]$WhatIfRun = $false, [string]$ScriptsRoot, [string]$ScriptPath, $Cmdlet)
     if ($AdminPhase -and (Get-CleanCurrentSid) -ine $OriginalUserSid) {
         # 必须先于上下文、报告、日志及结果文件的任何访问；父进程将非零退出映射为跳过。
         throw '没有获得原账户的管理员权限，已跳过。'
     }
     try {
-        if ($AdminPhase) { $context = Get-CleanerContext -OriginalUserSid $OriginalUserSid -OriginalUserProfile $OriginalUserProfile }
-        else { $context = Get-CleanerContext }
+        $contextArgs = @{}
+        if ($LogDirectory) { $contextArgs.LogDirectory = $LogDirectory }
+        if ($AdminPhase) { $contextArgs.OriginalUserSid = $OriginalUserSid; $contextArgs.OriginalUserProfile = $OriginalUserProfile }
+        $context = Get-CleanerContext @contextArgs
     }
     catch { throw '无法确认当前账户，请使用体检时的同一账户。' }
     $inputFile = Read-CleanJsonFile $ReportPath
@@ -562,20 +582,30 @@ function Invoke-CleanCommand {
         $resultPathFull = Get-CleanNewFilePath $ResultPath $context
         $file = New-CleanResultFile $resultPathFull $context
     }
-    catch { throw '无法创建新的清理结果文件，请选择可写入且尚不存在的文件路径。' }
+    catch {
+        $reason = '无法创建新的清理结果文件，请选择可写入且尚不存在的文件路径。'
+        $diagnostics = Get-CleanFailureDiagnostics 'Clean/ResultFile' $ResultPath $_
+        # 结果位置本身不可写时，诊断只能通过标准输出交给代理，不再尝试其他写入。
+        $failure = @{ Schema = 'pc-care/clean/1'; Status = 'Failed'; Reason = $reason; Diagnostics = $diagnostics }
+        Write-Output (ConvertTo-Json -InputObject $failure -Depth 8 -Compress)
+        Write-Output 'RESULT: 未保存'
+        throw $reason
+    }
     $started = [DateTimeOffset]::Now
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $before = Get-CleanFreeBytes
-    $rows = @(); $steps = @{}
+    $rows = @(); $steps = @{}; $diagnostics = $null; $stage = 'Clean/StartLog'
     try {
         try {
             Write-CleanerLog -Action 'Clean/Start' -Path $inputFile.Path -Result 'Started' -Context $context `
                 -Message ('清理项目：' + (@($plan.Selected | ForEach-Object { $_.Id }) -join '、')) -Confirm:$false -ErrorAction Stop | Out-Null
+            $stage = 'Clean/Execute'
             $childPath = Join-Path $logDirectory ('clean-admin-' + [guid]::NewGuid().ToString('N') + '.json')
             $phaseResult = Invoke-CleanPhases $plan.Selected $context $ScriptPath $inputFile.Path $childPath ([guid]::NewGuid()) $AdminPhase
             $rows = @($phaseResult.Items); $steps = $phaseResult.Steps
         }
         catch {
+            $diagnostics = Get-CleanFailureDiagnostics $stage $context.LogPath $_
             $rows = @(foreach ($item in $plan.Selected) { New-CleanItemResult $item 'Failed' '清理记录无法完整保存，已停止；请稍后重新体检' })
         }
         $rows += @(foreach ($item in $plan.Unselected) { New-CleanItemResult $item 'Skipped' '你没有选择' 0 })
@@ -588,6 +618,7 @@ function Invoke-CleanCommand {
             Items = @($rows); Ignored = @($plan.Ignored); FreedBytes = Get-CleanDelta $before $after; FreedBytesIsEstimate = $true
             FreedBytesNote = '按 C 盘可用空间变化估算，后台活动可能影响数值；负值表示可用空间减少。'
             FreeBefore = $before; FreeAfter = $after; Timings = @{ TotalMs = $watch.ElapsedMilliseconds; Steps = $steps } }
+        if ($null -ne $diagnostics) { $result.Diagnostics = $diagnostics }
         Write-CleanResultJson $file $result
     }
     finally { Close-CleanResultFile $file }
@@ -601,5 +632,5 @@ function Invoke-CleanCommand {
 }
 
 Invoke-CleanCommand -ReportPath $ReportPath -Include $Include -ResultPath $ResultPath -AdminPhase ([bool]$AdminPhase) `
-    -AdminItemIds $AdminItemIds -OriginalUserSid $OriginalUserSid -OriginalUserProfile $OriginalUserProfile -RequestId $RequestId `
+    -LogDirectory $LogDirectory -AdminItemIds $AdminItemIds -OriginalUserSid $OriginalUserSid -OriginalUserProfile $OriginalUserProfile -RequestId $RequestId `
     -WhatIfRun ([bool]$WhatIfPreference) -ScriptsRoot $PSScriptRoot -ScriptPath $PSCommandPath -Cmdlet $PSCmdlet

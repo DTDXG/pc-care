@@ -21,7 +21,7 @@ $script:CleanerTargets=Import-PowerShellDataFile (Join-Path $repo 'scripts/targe
 $script:MigrationSid='S-test';$script:MigrationProfile='C:\Users\me';$script:MoveDocument=[pscustomobject]@{Entries=@()}
 $script:MigrationContext=[pscustomobject]@{
     OriginalUserSid='S-test';CurrentUserSid='S-test';OriginalUserProfile='C:\Users\me';OriginalUserVerified=$true
-    SystemDrive='C:';SystemRoot='C:\Windows';SyncRoots=@();ProtectedMachineRoots=@('C:\Program Files');LogPath='C:\Users\me\AppData\Local\pc-care\logs\audit.jsonl'
+    SystemDrive='C:';SystemRoot='C:\Windows';SyncRoots=@();ProtectedMachineRoots=@('C:\Program Files');LogPath='C:\Users\me\AppData\Local\CDriveCleaner\Logs\audit.jsonl'
     Variables=@{USERPROFILE='C:\Users\me';APPDATA='C:\Users\me\AppData\Roaming';LOCALAPPDATA='C:\Users\me\AppData\Local';ProgramData='C:\ProgramData';SystemRoot='C:\Windows';SystemDrive='C:';ProgramFiles='C:\Program Files';'ProgramFiles(x86)'='C:\Program Files (x86)';ProgramW6432='C:\Program Files'}
 }
 function New-T6Facts {return @{AlreadyMoved=$false;OneDrive=$false;RunningApps=@();IsFixed=$true;IsLocal=$true;FileSystem='NTFS';SystemVolume=$false;Forbidden=$false;NonEmpty=$false;Resume=$false;Bytes=[long]1000;FreeBytes=[long]1100}}
@@ -355,10 +355,10 @@ Assert-T6 ($script:resumed -eq $r.Id) 'P3 identical command resumes existing rec
 # Real shared whitelist matching with fake handles; sidecar scope must not leak outside log directory.
 Restore-T6 @('Assert-MoveRecord','Assert-MigrationTarget','Test-CleanerRetainedChat')
 function Get-CleanerEntryMetadata {param($LiteralPath) [pscustomobject]@{IsDirectory=($LiteralPath -notmatch '\.(tsv|json)(?:\.|$)');LinkCount=1}}
-foreach($path in @('C:\Users\me\AppData\Local\pc-care\logs\move-inventory-'+('a'*32)+'.tsv')) {
+foreach($path in @('C:\Users\me\AppData\Local\CDriveCleaner\Logs\move-inventory-'+('a'*32)+'.tsv')) {
     Assert-T6 ((Test-SafeTarget $path MigrationManifest $script:MigrationContext).IsSafe) 'P2 sidecar accepted by actual MigrationManifest matching'
 }
-foreach($path in @('C:\Users\me\AppData\Local\pc-care\move-inventory-a.tsv','C:\Users\me\AppData\Local\pc-care\logs\other.tsv','C:\Users\me\Documents')) {
+foreach($path in @('C:\Users\me\AppData\Local\pc-care\move-inventory-a.tsv','C:\Users\me\AppData\Local\CDriveCleaner\Logs\other.tsv','C:\Users\me\Documents')) {
     Assert-T6 (-not (Test-SafeTarget $path MigrationManifest $script:MigrationContext).IsSafe) 'P2 non-sidecar/outside log rejected'
 }
 foreach($path in @('C:\Users\me\Documents','C:\Users\me\AppData','C:\Users\me\Documents\OtherApp')) {
@@ -772,10 +772,10 @@ Assert-ThrowsT6 {Assert-MigrationSeparation 'C:\src' 'C:\src\child'} 'nested des
     Restore-T6 @('Get-CleanerMigrationTarget','Test-SafeTarget')
     function Get-CleanerEntryMetadata {param($LiteralPath) [pscustomobject]@{IsDirectory=($LiteralPath -notmatch '\.(tsv|json)(?:\.|$)');LinkCount=1}}
     foreach($suffix in @('.tsv','-v2.tsv','-v10.tsv','-v200.tsv')){
-        Assert-T6 ((Test-SafeTarget ('C:\Users\me\AppData\Local\pc-care\logs\move-inventory-'+('a'*32)+$suffix) MigrationManifest $script:MigrationContext).IsSafe) ('R4 version whitelist '+$suffix)
+        Assert-T6 ((Test-SafeTarget ('C:\Users\me\AppData\Local\CDriveCleaner\Logs\move-inventory-'+('a'*32)+$suffix) MigrationManifest $script:MigrationContext).IsSafe) ('R4 version whitelist '+$suffix)
     }
     foreach($suffix in @('-v1.tsv','-v0.tsv','-v02.tsv','-v2.tsv.exe','-v2.tsv\child')){
-        Assert-T6 (-not (Test-SafeTarget ('C:\Users\me\AppData\Local\pc-care\logs\move-inventory-'+('a'*32)+$suffix) MigrationManifest $script:MigrationContext).IsSafe) ('R4 invalid sidecar version/name refused '+$suffix)
+        Assert-T6 (-not (Test-SafeTarget ('C:\Users\me\AppData\Local\CDriveCleaner\Logs\move-inventory-'+('a'*32)+$suffix) MigrationManifest $script:MigrationContext).IsSafe) ('R4 invalid sidecar version/name refused '+$suffix)
     }
 }
 

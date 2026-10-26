@@ -21,6 +21,8 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'Apply')][string]$PlanPath,
     [Parameter(ParameterSetName = 'Apply')][string]$ResultPath,
     [Parameter(ParameterSetName = 'Apply')][string]$OriginalUserSid,
+    [Parameter(ParameterSetName = 'Apply')][string]$OriginalUserProfile,
+    [string]$LogDirectory,
     [Parameter(ParameterSetName = 'Apply')][switch]$ElevatedChild,
     [Parameter(ParameterSetName = 'Apply')][switch]$RecoveryKeyConfirmed,
     [Parameter(ParameterSetName = 'Apply', DontShow = $true)][hashtable]$ChildState
@@ -1127,11 +1129,12 @@ function ConvertTo-PcLiteral {
 }
 
 function New-PcElevationCommand {
-    param([string]$ScriptPath, [string]$InputPath, [string]$OutputPath, [string]$Sid, [switch]$RecoveryKeyConfirmed)
+    param([string]$ScriptPath, [string]$InputPath, [string]$OutputPath, [string]$Sid, [switch]$RecoveryKeyConfirmed, [string]$LogDirectory, [string]$OriginalUserProfile)
     $confirmation = ''; if ($RecoveryKeyConfirmed) { $confirmation = ' -RecoveryKeyConfirmed' }
     # 13：换账户；12：捕获异常且尚未进入磁盘步骤；21：步骤可能已运行。其他退出码不能证明未修改。
     return ('$ErrorActionPreference = ''Stop''; $childState = @{ StepMayHaveRun = $false }; try { if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -cne ' + (ConvertTo-PcLiteral $Sid) + ') { exit 13 }; & ' + (ConvertTo-PcLiteral $ScriptPath) + ' -Apply -ElevatedChild -PlanPath ' + (ConvertTo-PcLiteral $InputPath) +
-        ' -ResultPath ' + (ConvertTo-PcLiteral $OutputPath) + ' -OriginalUserSid ' + (ConvertTo-PcLiteral $Sid) + $confirmation + ' -ChildState $childState -Confirm:$false -WhatIf:$false; exit 0 } catch { if ($childState.StepMayHaveRun) { exit 21 }; exit 12 }')
+        ' -ResultPath ' + (ConvertTo-PcLiteral $OutputPath) + ' -OriginalUserSid ' + (ConvertTo-PcLiteral $Sid) +
+        ' -OriginalUserProfile ' + (ConvertTo-PcLiteral $OriginalUserProfile) + ' -LogDirectory ' + (ConvertTo-PcLiteral $LogDirectory) + $confirmation + ' -ChildState $childState -Confirm:$false -WhatIf:$false; exit 0 } catch { if ($childState.StepMayHaveRun) { exit 21 }; exit 12 }')
 }
 
 function Get-PcElevationArguments {
@@ -1172,7 +1175,7 @@ function Get-PcMissingChildResult {
 
 function Invoke-PcPartitionMain {
     param([string]$ScriptPath, [bool]$Planning, [string]$LayoutJson, [string]$InputPath, [string]$OutputPath,
-        [string]$ExpectedSid, [bool]$Child, [bool]$DryRun, [string]$BitLockerPolicy = $script:BitLockerShrinkPolicy, [hashtable]$ChildState, [switch]$RecoveryKeyConfirmed)
+        [string]$ExpectedSid, [bool]$Child, [bool]$DryRun, [string]$BitLockerPolicy = $script:BitLockerShrinkPolicy, [hashtable]$ChildState, [switch]$RecoveryKeyConfirmed, [string]$LogDirectory, [string]$OriginalProfile)
     if ($DryRun) {
         if ($Planning) { Write-Host '演练：只读规划并新建方案文件；当前不会写入文件。'; return }
         try {
@@ -1185,7 +1188,12 @@ function Invoke-PcPartitionMain {
         Write-Output ('RESULT: ' + [IO.Path]::GetFullPath($InputPath)); return
     }
     $context = $null
-    try { $context = Get-CleanerContext } catch { }
+    if ($Child -and (-not $LogDirectory -or -not $OriginalProfile)) { throw '没有收到原账户的记录目录，已停止分区。' }
+    $contextArgs = @{}
+    if ($Child) { $contextArgs.OriginalUserSid = $ExpectedSid; $contextArgs.OriginalUserProfile = $OriginalProfile }
+    if ($LogDirectory) { $contextArgs.LogDirectory = $LogDirectory }
+    try { $context = Get-CleanerContext @contextArgs }
+    catch { }
     if ($Planning) {
         try {
             if ($null -eq $context) { throw '无法读取当前账户信息。' }
@@ -1203,7 +1211,7 @@ function Invoke-PcPartitionMain {
         $r = New-PcSkippedResult '提权使用了另一个账户，已跳过分区，未修改任何分区；请使用原账户确认权限。' $context.CurrentUserSid
     }
     elseif (-not $context.IsAdmin -and -not $Child) {
-        $command = New-PcElevationCommand $ScriptPath ([IO.Path]::GetFullPath($InputPath)) $path $context.CurrentUserSid -RecoveryKeyConfirmed:$RecoveryKeyConfirmed
+        $command = New-PcElevationCommand $ScriptPath ([IO.Path]::GetFullPath($InputPath)) $path $context.CurrentUserSid -RecoveryKeyConfirmed:$RecoveryKeyConfirmed -LogDirectory (Split-Path -Path $context.LogPath -Parent) -OriginalUserProfile $context.OriginalUserProfile
         try { $exitCode = Start-PcElevatedApply $command }
         catch {
             $r = New-PcSkippedResult '没有获得管理员权限，已跳过分区。' $context.CurrentUserSid
@@ -1240,4 +1248,4 @@ function Invoke-PcPartitionMain {
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw '分区规划仅支持 Windows 10 和 Windows 11。' }
 . (Join-Path $PSScriptRoot 'common.ps1')
 Invoke-PcPartitionMain -ScriptPath $PSCommandPath -Planning ([bool]$Plan) -LayoutJson $Layout -InputPath $PlanPath -OutputPath $ResultPath `
-    -ExpectedSid $OriginalUserSid -Child ([bool]$ElevatedChild) -DryRun ([bool]$WhatIfPreference) -BitLockerPolicy $script:BitLockerShrinkPolicy -RecoveryKeyConfirmed:$RecoveryKeyConfirmed -ChildState $ChildState
+    -LogDirectory $LogDirectory -OriginalProfile $OriginalUserProfile -ExpectedSid $OriginalUserSid -Child ([bool]$ElevatedChild) -DryRun ([bool]$WhatIfPreference) -BitLockerPolicy $script:BitLockerShrinkPolicy -RecoveryKeyConfirmed:$RecoveryKeyConfirmed -ChildState $ChildState

@@ -887,7 +887,7 @@ Assert-Equal @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.C
 & {
     $script:capturedCommand = ''; $script:childConfirmed = $false; $admin = $false
     $s = New-TestState; $p = New-PcPartitionPlan $s
-    function Get-CleanerContext { return @{ IsAdmin = $admin; CurrentUserSid = 'test-sid' } }
+    function Get-CleanerContext { return @{ IsAdmin = $admin; CurrentUserSid = 'test-sid'; OriginalUserProfile = 'C:\Users\me'; LogPath = 'C:\Users\me\AppData\Local\CDriveCleaner\Logs\audit.jsonl' } }
     function Get-PcOutputPath { param($Path, $Kind, $Context); return 'memory-confirmation-result.json' }
     function Write-PcJson { param($Value, $Path) }
     function Read-PcJson { param($Path); return $p }
@@ -902,7 +902,7 @@ Assert-Equal @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.C
         $decoded = $decoded.Replace('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value', "'test-sid'") -replace '\bexit (0|12|13|21)\b', 'return $1'
         function Invoke-TestConfirmedChild {
             [CmdletBinding(SupportsShouldProcess = $true)]
-            param([switch]$Apply, [switch]$ElevatedChild, $PlanPath, $ResultPath, $OriginalUserSid, $ChildState, [switch]$RecoveryKeyConfirmed)
+            param([switch]$Apply, [switch]$ElevatedChild, $PlanPath, $ResultPath, $OriginalUserSid, $OriginalUserProfile, $LogDirectory, $ChildState, [switch]$RecoveryKeyConfirmed)
             $script:childConfirmed = [bool]$RecoveryKeyConfirmed
         }
         Assert-Equal (& ([scriptblock]::Create($decoded))) 0 'B4 假提权子入口正常运行'
@@ -916,7 +916,7 @@ Assert-Equal @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.C
     }
     foreach ($child in @($false, $true)) {
         foreach ($confirmed in @($false, $true)) {
-            $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -Child $child -RecoveryKeyConfirmed:$confirmed)
+            $null = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -Child $child -LogDirectory 'C:\Users\me\AppData\Local\CDriveCleaner\Logs' -OriginalProfile 'C:\Users\me' -RecoveryKeyConfirmed:$confirmed)
             Assert-Equal $script:childConfirmed $confirmed 'B4 已提权主入口向执行器转发确认'
         }
     }
@@ -1014,7 +1014,7 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
         Assert-True (-not $unavailable.Feasible -and $unavailable.NeedsElevatedRead) ('R3a 实际权限失败标记 ' + $denied)
         Assert-True (($output -join '') -match 'RESULT: memory-read-result.json') ('R3a 实际读取失败仍输出 RESULT ' + $denied)
         $script:readFailureWrites = @()
-        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -Child $true -BitLockerPolicy 'Block')
+        $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -Child $true -LogDirectory 'C:\Users\me\AppData\Local\CDriveCleaner\Logs' -OriginalProfile 'C:\Users\me' -BitLockerPolicy 'Block')
         Assert-Equal $script:readFailureWrites[0].Status 'Refused' ('R3b 实际读取失败仍写子结果 ' + $denied)
         Assert-Equal $script:readFailureWrites[0].StoppedAt 'Preflight' ('R3b 实际读取失败无磁盘步骤 ' + $denied)
     }
@@ -1023,7 +1023,7 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
 # UAC 和主入口：完全用内存结果替代磁盘文件，确认每次 Apply 最多请求一次权限。
 & {
     $script:launches = 0; $script:mainWrites = @(); $script:launchMode = 'Cancel'; $script:mainState = New-TestState
-    function Get-CleanerContext { return @{ IsAdmin = $false; CurrentUserSid = 'test-sid'; LogPath = 'fake-log' } }
+    function Get-CleanerContext { return @{ IsAdmin = $false; CurrentUserSid = 'test-sid'; OriginalUserProfile = 'C:\Users\me'; LogPath = 'C:\Users\me\AppData\Local\CDriveCleaner\Logs\audit.jsonl' } }
     function Get-PcOutputPath { param($Path, $Kind, $Context); return 'memory-result.json' }
     function Write-PcJson { param($Value, $Path); $script:mainWrites += $Value }
     function Read-PcPartitionState { param($Context); return $script:mainState }
@@ -1073,7 +1073,7 @@ Assert-True (($output -join '') -match 'RESULT: .*fake-plan.json') '演练只引
     $mode = 'Before'
     function Invoke-TestChild {
         [CmdletBinding(SupportsShouldProcess = $true)]
-        param([switch]$Apply, [switch]$ElevatedChild, $PlanPath, $ResultPath, $OriginalUserSid, $ChildState)
+        param([switch]$Apply, [switch]$ElevatedChild, $PlanPath, $ResultPath, $OriginalUserSid, $OriginalUserProfile, $LogDirectory, $ChildState)
         if ($mode -eq 'Before') { throw 'Access denied before script execution' }
         if ($mode -eq 'After') { $ChildState.StepMayHaveRun = $true; throw 'Result write failed after step' }
     }
@@ -1215,7 +1215,7 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
     $mode = ''; $admin = $true; $exitCode = 0; $state = New-TestState; $planObject = New-PcPartitionPlan $state
     function Get-CleanerContext {
         if ($mode -eq 'Context') { throw 'Access is denied' }
-        return @{ IsAdmin = $admin; CurrentUserSid = 'test-sid'; LogPath = 'memory-log' }
+        return @{ IsAdmin = $admin; CurrentUserSid = 'test-sid'; OriginalUserProfile = 'C:\Users\me'; LogPath = 'C:\Users\me\AppData\Local\CDriveCleaner\Logs\audit.jsonl' }
     }
     function Get-PcOutputPath { param($Path, $Kind, $Context); return 'memory-result.json' }
     function Write-PcJson { param($Value, $Path); $script:failureWrites += (Copy-TestObject $Value) }
@@ -1243,7 +1243,7 @@ foreach ($read in @('DiskKind', 'BitLocker', 'MaxShrink')) {
     foreach ($child in @($false, $true)) {
         foreach ($failure in @('Missing', 'Unreadable', 'Malformed', 'Incomplete', 'Live', 'Context')) {
             $mode = $failure; $script:failureWrites = @(); $script:failureExecCalls = 0; $script:failureReads = 0
-            $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -OutputPath 'child-result.json' -Child $child -BitLockerPolicy 'Block')
+            $output = @(Invoke-PcPartitionMain -ScriptPath 'fake.ps1' -Planning $false -InputPath 'plan.json' -OutputPath 'child-result.json' -Child $child -LogDirectory 'C:\Users\me\AppData\Local\CDriveCleaner\Logs' -OriginalProfile 'C:\Users\me' -BitLockerPolicy 'Block')
             Assert-Equal $script:failureWrites.Count 1 ('R3b 每次失败保存唯一结果 ' + $child + '/' + $failure)
             $r = $script:failureWrites[0]
             Assert-Equal $r.Schema 'pc-care/partition/1' 'R3b 结果契约'

@@ -120,3 +120,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\parti
 - 不手删系统目录、软件安装目录、聊天记录、浏览器登录信息或同步文件；搬家仅处理脚本认可的数据和副本，释放仅删除本次记录中的保留原件。
 - 不移动、合并或删除已有分区，不扩容 C 盘，不低于保留空间压缩，不处理特殊磁盘组合或有数据的其他硬盘。
 - 尚未在真实 Windows 上完成验证；Linux 模拟通过不代表真机通过。真实修改流程须先在 Windows 10 / 11 测试环境验证。
+
+记录保存在共享日志目录；在商店打包的代理应用内，位置为 `%LOCALAPPDATA%\Packages\<app>\LocalCache\Local\CDriveCleaner\Logs`。卸载该应用会删除这些记录，请先完成搬家的释放原件或还原。
