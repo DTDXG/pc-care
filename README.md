@@ -13,6 +13,8 @@ pc-care 是面向普通中文 Windows 10 / 11 用户的电脑空间保养 skill�
 
 体检只统计已知位置，目标 30 秒内给结论；当前脚本默认总预算 45 秒、上限 60 秒，真实耗时待测。统计不全时说“至少”，未知不当成零；清理释放量按 C 盘空闲变化估算，可能受其他程序影响。
 
+清理现在有两个模式：默认 `Quick` 对每个缓存项目设置 15 秒预算，在安全检查点停止并报告保留的内容；`Full` 不设缓存预算。二者使用相同的删除安全规则。预算不包含系统工具、UAC 等待及无法中断的单步操作，不能理解为整个清理固定 15 秒完成。旧版 `c-drive-cleaner` 的 `-Quick` 是扫描参数，与此处清理模式不同。
+
 ## 安全原则
 
 - 不杀进程。需要退出软件时由 AI 请用户正常关闭，文件被占用就跳过或停止当前项。
@@ -30,11 +32,13 @@ pc-care 是面向普通中文 Windows 10 / 11 用户的电脑空间保养 skill�
 
 实际操作需要 Windows 10 / 11 和 Windows PowerShell 5.1 或 PowerShell 7，宿主能在原用户会话运行 PowerShell、读取本地结果文件。系统操作需要用户允许 UAC；搬家需要容量足够的本地固定 NTFS 数据盘。新建分区使用 Windows 自带磁盘管理接口。
 
+默认记录目录为原用户的 `%USERPROFILE%\.pc-care\Logs`，不依赖客户端包身份或安装位置。同一用户换用支持本地执行的客户端时仍可使用该目录。保留对旧日志目录的显式支持；已有未完成搬家须按原记录位置继续，不能因新目录为空就重复搬家。具体规则见 [体检与清理参考](references/targets.md)。
+
 用户流程：描述问题 → AI 体检并给建议 → 聊天确认清理或某一项搬家 → AI 执行并解释结果。搬家原件要等用户试用后另行确认释放；分区须先看方案，再明确二次确认。所有命令都由 AI 执行。
 
 ## 当前状态
 
-**尚未在真实 Windows 上完成验证。** Linux 上的解析和模拟测试不能证明 Windows 权限、UAC、服务、真实复制 / 删除和分区效果正确；Windows PowerShell 5.1 真机兼容性也待验证。真实修改流程须先在 Windows 10 / 11 测试环境完整跑通。
+**尚未完成 Windows 10 / 11 的全流程验证。** 本次优化已在 Windows 11 的 Windows PowerShell 5.1 和 PowerShell 7 上验证隔离样本删除、近期/只读/白名单外文件保护、预算停止和默认日志写入。模拟测试及局部真机验证不能证明 UAC、系统服务、真实搬家和分区全流程正确；发布前仍须在 Windows 10 / 11 测试环境完整跑通。
 
 当前分支已包含体检、清理、搬家和分区入口，以及搬家模拟测试。搬家、释放和还原返回 `Running` 时，AI 用 `move.ps1 -Status -Id <记录Id>` 每 30 秒查询；`Stalled` 时按原操作续传，搬家也可用 `-ResumeId <记录Id>`。`Done` 须按操作区分搬好待试用、已释放或已还原；`NeedsAppExit` 请用户正常退出软件，`NotEnoughSpace` 先解决空间不足，`AlreadyMoved` 不重复搬家，`Failed` 按原因处理并保留数据，释放失败可能已删部分原件。字段、子项结果及续传规则见 [搬家参考](references/migration.md)。
 
@@ -63,10 +67,12 @@ Write-Output "PASS: all scripts parse with zero errors"
 运行所有现存测试（普通断言脚本，不需要 Pester）：
 
 ```bash
-for pc_care_test in tests/*.ps1; do
+for pc_care_test in tests/*.tests.ps1; do
   "$pc_care_pwsh" -NoProfile -File "$pc_care_test" || exit 1
 done
 git diff --check
 ```
 
 测试只从语法树加载逻辑函数并模拟系统状态，不执行脚本的 Windows 主体；上述命令已包含 `tests/t6-move.tests.ps1`。
+
+Windows 原生隔离测试另行运行 `tests/t10-windows-smoke.ps1 -FixtureParent <已存在的测试目录绝对路径>`。它只创建、处理本次生成的样本，保留近期/只读/白名单外样本供检查，不扫描真实缓存；默认记录目录会新增一条自检日志。分别用 Windows PowerShell 5.1 和 PowerShell 7 验证。

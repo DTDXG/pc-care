@@ -50,7 +50,9 @@ WindowsTemp、更新缓存和部分系统项目需要管理员权限，以本地
 
 ## 清理入口与结果
 
-[clean.ps1](../scripts/clean.ps1)：`-ReportPath <体检JSON> [-Include <确认项Id数组>] [-ResultPath <新文件>] [-WhatIf]`。
+[clean.ps1](../scripts/clean.ps1)：`-ReportPath <体检JSON> [-Mode Quick|Full] [-CacheBudgetSeconds 15] [-Include <确认项Id数组>] [-ResultPath <新文件>] [-WhatIf]`。
+
+- `Quick` 是默认清理模式：每个 `clean-cache.ps1` 缓存项目默认 15 秒预算，可用 `CacheBudgetSeconds` 调整为 1–600 秒。到安全检查点停止处理剩余内容，结果为部分完成或跳过并带原因；枚举、正在进行的单步操作及系统工具/UAC 耗时另计，不是硬性全程超时。`Full` 不设缓存预算，两种模式的删除安全规则相同。结果新增 `Mode/CacheBudgetSeconds`；完整模式预算记为 0。
 
 - 报告须是 `pc-care/checkup/1`、同一原用户、生成不超过 24 小时。未知的新 Id 忽略；已知 Id 的分组和处理器必须合法。脚本重新解析实际目标，不信报告给出的命令、路径或权限。
 - 自动运行报告中的全部 safe 项。Include 只接受报告中存在且用户点名的 confirm 项；不传则全部确认项不选。不能用 Include 选择单个放心清项目。
@@ -60,3 +62,9 @@ WindowsTemp、更新缓存和部分系统项目需要管理员权限，以本地
 - 总 `FreedBytes` 与项目值均为 C 盘空闲变化估算，`FreedBytesIsEstimate=true`；后台活动会干扰，不能加总项目值代替总值。负值为可用空间减少，null 为无法测量。所有未完成项解释 Reason，不把部分成功说成全部完成。
 
 V1 不启用底层旧处理器的开发者缓存、组件存储、还原点存储、保留存储或页面文件能力。不要直接调用底层脚本的默认“全部”范围来绕过 V1 范围。
+
+## 跨客户端记录位置
+
+默认使用从已核实的原用户配置推导的 `%USERPROFILE%\.pc-care\Logs`，不依赖宿主品牌、应用包身份、安装目录或当前工作目录。普通进程、后台进程和 UAC 子进程保持同一个记录目录；日志与结果文件仍执行原有重解析点、禁止目录、最终路径与句柄校验。路径不可用即报告原因，不能通过关闭校验来适配客户端。
+
+已有记录不自动迁移。为续传旧搬家，先按已知记录路径核实原目录，再在本次调用及后续状态查询中设置 `CLEANER_LOG_PATH=<原目录中的新唯一文件名>.jsonl`，结束后恢复环境变量。允许的旧记录目录为原用户 LocalAppData 下的 `CDriveCleaner\Logs` 和 `Packages\<合法包名>\LocalCache\Local\CDriveCleaner\Logs`；不得猜测另一个用户或应用的目录。新位置找不到记录时，先查旧记录而不是发起新的搬家。

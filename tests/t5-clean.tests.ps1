@@ -227,8 +227,11 @@ finally { $memory.Dispose() }
 function Invoke-TestAdmin {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([switch]$AdminPhase, [string]$ReportPath, [string[]]$AdminItemIds, [string]$ResultPath,
-        [string]$OriginalUserSid, [string]$OriginalUserProfile, [guid]$RequestId, [string]$LogDirectory)
+        [string]$OriginalUserSid, [string]$OriginalUserProfile, [guid]$RequestId, [string]$LogDirectory,
+        [string]$Mode, [int]$CacheBudgetSeconds)
     Assert-True $AdminPhase '内部管理员参数集'
+    Assert-Equal $Mode 'Quick' '管理员阶段继承快速模式'
+    Assert-Equal $CacheBudgetSeconds 15 '管理员阶段继承缓存预算'
     Assert-Equal $ReportPath "C:\报'告\checkup.json" '报告路径单引号不丢失'
     Assert-Equal $OriginalUserProfile $context.OriginalUserProfile '原用户目录尾部反斜线与引号保留'
     Assert-Equal $OriginalUserSid $context.OriginalUserSid '原账户明确传入'
@@ -402,6 +405,8 @@ Assert-Equal @($script:events | Where-Object { $_ -like 'run:*' }).Count 1 '普�
 Assert-True ([array]::IndexOf($script:events, 'run:cache:UserTemp') -lt [array]::IndexOf($script:events, 'uac')) '普通权限阶段先于提权'
 Assert-Equal ($script:written.Items.Status -join ',') 'Done,Skipped,Skipped,Skipped,Skipped,Skipped' '拒绝 UAC 不影响已完成用户项，未选项保留'
 Assert-Equal $script:written.Schema 'pc-care/clean/1' '新结果架构'
+Assert-Equal $script:written.Mode 'Quick' '默认结果记录快速模式'
+Assert-Equal $script:written.CacheBudgetSeconds 15 '默认结果记录缓存预算'
 Assert-Equal $script:written.Ignored.Count 3 '结果列出忽略项目'
 Assert-Equal $output[-1] 'RESULT: /fake/result.json' '输出最终结果路径'
 Assert-True ($script:events -contains 'create' -and $script:events -contains 'write' -and $script:events -contains 'close') '结果文件创建、写入和释放'

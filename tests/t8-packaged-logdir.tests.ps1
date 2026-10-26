@@ -22,6 +22,7 @@ function Assert-ThrowsT8 {
 $local = 'C:\Users\me\AppData\Local'
 $plain = $local + '\CDriveCleaner\Logs'
 $packaged = $local + '\Packages\OpenAI.Codex_abc123\LocalCache\Local\CDriveCleaner\Logs'
+$portable = 'C:\Users\me\.pc-care\Logs'
 Assert-T8 ((Get-CleanerLogBase $local '') -ceq $plain) 'unpackaged log base'
 Assert-T8 ((Get-CleanerLogBase $local 'OpenAI.Codex_abc123') -ceq $packaged) 'packaged log base'
 foreach ($family in @('', 'a\b_pub', '.._pub', 'a..b_pub', 'a:b_pub', 'a b_pub', 'missing', 'a_b_c', '_pub', 'app_', "app_pub`n")) {
@@ -45,9 +46,9 @@ $oldLog = [Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH')
 try {
     [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', $null)
     & {
-        function Get-CleanerPackageFamilyName { return @{ FamilyName = 'OpenAI.Codex_abc123'; Error = '' } }
+        function Get-CleanerPackageFamilyName { throw 'default location must not depend on the client package' }
         $resolved = & $contextTail -context $context
-        Assert-T8 ($resolved.LogPath.StartsWith($packaged + '\cleaner-')) 'Get-CleanerContext uses packaged default'
+        Assert-T8 ($resolved.LogPath.StartsWith($portable + '\cleaner-')) 'Get-CleanerContext uses client-independent default'
         $explicit = $plain + '\explicit.jsonl'
         [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', ($plain + '\environment.jsonl'))
         $resolved = & $contextTail -context $context -LogPath $explicit
@@ -64,8 +65,8 @@ try {
     & {
         function Get-CleanerPackageFamilyName { return @{ FamilyName = ''; Error = 'package lookup failed: 5' } }
         $resolved = & $contextTail -context $context
-        Assert-T8 ($resolved.LogPath.StartsWith($plain + '\cleaner-')) 'package lookup failure uses plain base'
-        Assert-T8 ($resolved.PackageIdentityDiagnostic -ceq 'package lookup failed: 5') 'package error retained in context'
+        Assert-T8 ($resolved.LogPath.StartsWith($portable + '\cleaner-')) 'package lookup failure cannot change default'
+        Assert-T8 ($resolved.PackageIdentityDiagnostic -ceq '') 'no package query needed'
     }
 } finally { [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', $oldLog) }
 
@@ -144,7 +145,7 @@ $context.LogPath = $packaged + '\parent.jsonl'
     function Get-CleanerPackageFamilyName { throw 'child must use the parent directory without a package lookup' }
     $script:chainVisits = @()
     function Test-CleanerPathChain { param($LiteralPath, [switch]$AllowMissing) $script:chainVisits += $LiteralPath; return @{ IsSafe = $true } }
-    foreach ($directory in @($plain, $packaged)) {
+    foreach ($directory in @($plain, $packaged, $portable)) {
         $parentLog = $context.LogPath
         $oldLog = [Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH')
         try {
@@ -156,7 +157,7 @@ $context.LogPath = $packaged + '\parent.jsonl'
             Assert-T8 ($child.LogPath -cne $first -and $child.LogPath -cne $parentLog) 'child logs are unique and ignore inherited file'
         } finally { [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', $oldLog) }
     }
-    Assert-T8 ($script:chainVisits.Count -eq 4) 'each child log passes strict path-chain validator'
+    Assert-T8 ($script:chainVisits.Count -eq 6) 'each child log passes strict path-chain validator'
     foreach ($bad in @('D:\CDriveCleaner\Logs', 'C:\Users\other\AppData\Local\CDriveCleaner\Logs',
         ($local + '\Wrong\Logs'), ($plain + '\..\Logs'), ($packaged + '\..\Logs'), ($plain + '\file.jsonl'),
         ($local + '\Packages\invalid\LocalCache\Local\CDriveCleaner\Logs'), '\\server\share\CDriveCleaner\Logs')) {
@@ -211,29 +212,35 @@ $context.LogPath = $packaged + '\parent.jsonl'
     }
 }
 
-# Exercise real parent loop and real metadata reparse refusal; POSIX lexical paths keep IO.Path iteration meaningful on Linux.
+# Exercise the real guard loop with host-native lexical paths; native calls remain mocked.
 & {
+    $guardInputPath = '/guard/profile/logs/file.jsonl'
+    $expected = '/,/guard,/guard/profile,/guard/profile/logs'
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $guardInputPath = 'C:\guard\profile\logs\file.jsonl'
+        $expected = 'C:\,C:\guard,C:\guard\profile,C:\guard\profile\logs'
+    }
+    [T8Native]::FailureAt = [IO.Path]::GetDirectoryName($guardInputPath)
     function Get-CleanerNativeType { return [T8Native] }
     function Get-CleanerFinalHandlePath {
         param($Handle)
         if ($script:mismatch -and [T8Native]::Path -ceq [T8Native]::FailureAt) { return '/redirected/logs' }
         return [T8Native]::Path
     }
-    $expected = '/,/guard,/guard/profile,/guard/profile/logs'
     $script:mismatch = $false; [T8Native]::Reparse = $false; [T8Native]::Visited.Clear()
-    $guards = Open-CleanerParentGuards '/guard/profile/logs/file.jsonl'
+    $guards = Open-CleanerParentGuards $guardInputPath
     try {
         Assert-T8 (([T8Native]::Visited -join ',') -ceq $expected) 'guard loop visits all four expected ancestors'
         Assert-T8 ($guards.Handles.Count -eq 4) 'all ancestors stay guarded'
     } finally { foreach ($handle in $guards.Handles) { $handle.Dispose() } }
     $script:mismatch = $true; [T8Native]::Visited.Clear()
-    Assert-ThrowsT8 { Open-CleanerParentGuards '/guard/profile/logs/file.jsonl' } '父目录最终路径发生变化'
+    Assert-ThrowsT8 { Open-CleanerParentGuards $guardInputPath } '父目录最终路径发生变化'
     Assert-T8 (([T8Native]::Visited -join ',') -ceq $expected) 'final-path mismatch tested after visiting every ancestor'
-    try { Open-CleanerParentGuards '/guard/profile/logs/file.jsonl' | Out-Null }
+    try { Open-CleanerParentGuards $guardInputPath | Out-Null }
     catch { $diagnostic = Get-CleanFailureDiagnostics 'Clean/ResultFile' '/guard/profile/logs/file.jsonl' $_ }
-    Assert-T8 ($diagnostic.RequestedPath -ceq '/guard/profile/logs' -and $diagnostic.FinalPath -ceq '/redirected/logs') 'real guard failure preserves requested and final ancestor paths'
+    Assert-T8 ($diagnostic.RequestedPath -ceq [T8Native]::FailureAt -and $diagnostic.FinalPath -ceq '/redirected/logs') 'real guard failure preserves requested and final ancestor paths'
     $script:mismatch = $false; [T8Native]::Reparse = $true; [T8Native]::Visited.Clear()
-    Assert-ThrowsT8 { Open-CleanerParentGuards '/guard/profile/logs/file.jsonl' } '重解析点'
+    Assert-ThrowsT8 { Open-CleanerParentGuards $guardInputPath } '重解析点'
     Assert-T8 (([T8Native]::Visited -join ',') -ceq $expected) 'reparse refusal tested after visiting every ancestor'
 }
 

@@ -14,6 +14,8 @@
 param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ReportPath,
     [Parameter(ParameterSetName = 'Public')][string[]]$Include = @(),
+    [ValidateSet('Quick', 'Full')][string]$Mode = 'Quick',
+    [ValidateRange(1, 600)][int]$CacheBudgetSeconds = 15,
     [string]$ResultPath,
     [Parameter(Mandatory = $true, ParameterSetName = 'Admin', DontShow = $true)][string]$LogDirectory,
     [Parameter(Mandatory = $true, ParameterSetName = 'Admin', DontShow = $true)][switch]$AdminPhase,
@@ -179,6 +181,7 @@ function Get-CleanPlainReason {
     if ($Text -match '维护进程|更新活动|更新.*运行|更新.*空闲|安装.*运行|安装标记|正在工作|BITS|更新标记|更新状态') {
         return '系统正在更新，或暂时无法确认更新是否结束，已跳过'
     }
+    if ($Text -match '快速清理时间预算') { return '快速清理已到时间预算，剩余内容已保留；可稍后继续或使用完整模式' }
     if ($Text -match '请.*退出|进程查询|查询.*进程|正在运行|检测到.*进程') { return '相关软件尚未退出，或无法确认是否退出，已跳过' }
     if ($Text -match '最近|时间晚于|年龄|未达到|too recent') { return '最近使用过的文件已保留' }
     if ($Text -match '不存在|无需清理') { return '这些文件已经不存在，无需清理' }
@@ -281,7 +284,11 @@ function Invoke-CleanItem {
         & $handler @parameters -Confirm:$false -WhatIf:$false 2>&1 3>&1 4>$null 5>$null 6>$null | ForEach-Object { $records.Add($_) }
     }
     catch { $failed = $true; $records.Add($_) }
-    finally { [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', $previousLog) }
+    finally {
+        # PowerShell 7.5/.NET distinguishes an absent variable from an empty one.
+        if ($null -eq $previousLog) { [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', [NullString]::Value) }
+        else { [Environment]::SetEnvironmentVariable('CLEANER_LOG_PATH', $previousLog) }
+    }
     $after = Get-CleanFreeBytes
     $outcome = Get-CleanOutcome $records.ToArray() $failed
     New-CleanItemResult $Item $outcome.Status $outcome.Reason (Get-CleanDelta $before $after) $before $after $watch.ElapsedMilliseconds
@@ -290,6 +297,7 @@ function Invoke-CleanItem {
 function Invoke-CleanItems {
     param([object[]]$Items, $Context)
     foreach ($item in $Items) {
+        Write-Host ('正在清理：' + $item.Title)
         try { Invoke-CleanItem $item $Context }
         catch { New-CleanItemResult $item 'Failed' '此项未能完成，请稍后重新清理；详细记录已保留' }
     }
@@ -382,6 +390,8 @@ function New-CleanAdminCommand {
     $command = '& ' + (ConvertTo-CleanLiteral $ScriptPath) + ' -AdminPhase -ReportPath ' + (ConvertTo-CleanLiteral $ReportPath)
     $command += ' -AdminItemIds @(' + $ids + ') -ResultPath ' + (ConvertTo-CleanLiteral $ResultPath)
     $command += ' -LogDirectory ' + (ConvertTo-CleanLiteral (Split-Path -Path $Context.LogPath -Parent))
+    $command += ' -Mode ' + (ConvertTo-CleanLiteral (Get-CleanProperty $Context 'CleanMode' 'Quick'))
+    $command += ' -CacheBudgetSeconds ' + [string](Get-CleanProperty $Context 'CleanCacheBudgetSeconds' 15)
     $command += ' -OriginalUserSid ' + (ConvertTo-CleanLiteral $Context.OriginalUserSid)
     $command += ' -OriginalUserProfile ' + (ConvertTo-CleanLiteral $Context.OriginalUserProfile)
     $command += ' -RequestId ' + (ConvertTo-CleanLiteral $RequestId.ToString()) + ' -Confirm:$false -WhatIf:$false'
@@ -540,6 +550,7 @@ function Invoke-CleanCommand {
     param([string]$ReportPath, [string[]]$Include = @(), [string]$ResultPath,
         [bool]$AdminPhase = $false, [string[]]$AdminItemIds = @(), [string]$OriginalUserSid,
         [string]$OriginalUserProfile, [guid]$RequestId = [guid]::Empty, [string]$LogDirectory,
+        [ValidateSet('Quick', 'Full')][string]$Mode = 'Quick', [ValidateRange(1, 600)][int]$CacheBudgetSeconds = 15,
         [bool]$WhatIfRun = $false, [string]$ScriptsRoot, [string]$ScriptPath, $Cmdlet)
     if ($AdminPhase -and (Get-CleanCurrentSid) -ine $OriginalUserSid) {
         # 必须先于上下文、报告、日志及结果文件的任何访问；父进程将非零退出映射为跳过。
@@ -560,11 +571,21 @@ function Invoke-CleanCommand {
         })
     }
     $plan = New-CleanPlan $inputFile.Value $context $Include $ScriptsRoot
+    $context | Add-Member -NotePropertyName CleanMode -NotePropertyValue $Mode -Force
+    $context | Add-Member -NotePropertyName CleanCacheBudgetSeconds -NotePropertyValue $CacheBudgetSeconds -Force
+    foreach ($item in $plan.Selected) {
+        if ($item.HandlerScript -eq 'clean-cache.ps1') {
+            $item.Parameters.TimeBudgetSeconds = 0
+            if ($Mode -eq 'Quick') { $item.Parameters.TimeBudgetSeconds = $CacheBudgetSeconds }
+        }
+    }
     if ($AdminPhase) {
         $plan.Selected = @(Select-CleanAdminItems $plan.Selected $AdminItemIds)
         $plan.Unselected = @(); $plan.Ignored = @()
     }
     if ($WhatIfRun) {
+        if ($Mode -eq 'Quick') { Write-Host ('快速清理：每个缓存项目最多处理约 {0} 秒，到安全检查点后保存部分结果；系统工具耗时另计。' -f $CacheBudgetSeconds) }
+        else { Write-Host '完整清理：缓存项目不设时间预算；安全规则与快速模式相同。' }
         foreach ($item in $plan.Selected) {
             $suffix = '使用当前权限'
             if ($item.NeedsAdmin -and -not $context.IsAdmin) { $suffix = '需要弹出管理员权限确认' }
@@ -614,6 +635,7 @@ function Invoke-CleanCommand {
         if ($AdminPhase) { $phase = 'Admin' }
         $result = [ordered]@{ Schema = 'pc-care/clean/1'; GeneratedAt = [DateTimeOffset]::Now.ToString('o')
             StartedAt = $started.ToString('o'); ReportPath = $inputFile.Path; Phase = $phase; RequestId = $RequestId.ToString()
+            Mode = $Mode; CacheBudgetSeconds = $(if ($Mode -eq 'Quick') { $CacheBudgetSeconds } else { 0 })
             OriginalUserSid = $context.OriginalUserSid; CurrentUserSid = $context.CurrentUserSid; IsAdmin = [bool]$context.IsAdmin
             Items = @($rows); Ignored = @($plan.Ignored); FreedBytes = Get-CleanDelta $before $after; FreedBytesIsEstimate = $true
             FreedBytesNote = '按 C 盘可用空间变化估算，后台活动可能影响数值；负值表示可用空间减少。'
@@ -632,5 +654,6 @@ function Invoke-CleanCommand {
 }
 
 Invoke-CleanCommand -ReportPath $ReportPath -Include $Include -ResultPath $ResultPath -AdminPhase ([bool]$AdminPhase) `
+    -Mode $Mode -CacheBudgetSeconds $CacheBudgetSeconds `
     -LogDirectory $LogDirectory -AdminItemIds $AdminItemIds -OriginalUserSid $OriginalUserSid -OriginalUserProfile $OriginalUserProfile -RequestId $RequestId `
     -WhatIfRun ([bool]$WhatIfPreference) -ScriptsRoot $PSScriptRoot -ScriptPath $PSCommandPath -Cmdlet $PSCmdlet

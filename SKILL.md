@@ -50,6 +50,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\clean
 
 需要演练时在同一调用上加 `-WhatIf`，演练后范围相同就继续。包含管理员项目时，执行前告知“会出现一次系统权限确认，请点‘是’”。报告过期（24 小时）、账户不符或内容无效时重新体检；范围变化才重新说明并确认。
 
+默认使用 `-Mode Quick`：每个缓存项目有 15 秒处理预算，在安全检查点停止并保存部分结果；系统工具、目录枚举和 UAC 等待另计，不承诺整个清理在 15 秒内完成。到点保留的内容必须如实说明，不自动反复续跑。用户要求完整清理时用 `-Mode Full`，不设缓存时间预算，仍保留同样的白名单、文件年龄、占用及路径安全检查。体检是限时扫描，与这两个清理模式不同；旧 `c-drive-cleaner` 的扫描参数 `-Quick` 不适用于这里。
+
 读取 `pc-care/clean/1`：报告总 `FreedBytes` 为“约 X GB（估算）”，参考 `FreeBefore/FreeAfter`；未知不报零，负值说明期间其他程序可能占用了更多空间。逐项把 `Partial/Skipped/Failed` 的 `Reason` 解释为普通中文，不声称全部成功，不叠加各项目估算当成实得。
 
 ## 3. 搬家：逐项完成，试用后释放原件
@@ -119,6 +121,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\parti
 - V1 不处理开发者缓存（npm/pip 等）、WSL、Docker、卷影副本 / 还原点存储、系统保留存储、页面文件、组件存储 / DISM、注册表清理、卸载软件。大软件只报告；不因底层处理器留有旧能力而调用它们。
 - 不手删系统目录、软件安装目录、聊天记录、浏览器登录信息或同步文件；搬家仅处理脚本认可的数据和副本，释放仅删除本次记录中的保留原件。
 - 不移动、合并或删除已有分区，不扩容 C 盘，不低于保留空间压缩，不处理特殊磁盘组合或有数据的其他硬盘。
-- 尚未在真实 Windows 上完成验证；Linux 模拟通过不代表真机通过。真实修改流程须先在 Windows 10 / 11 测试环境验证。
+- 本版已在 Windows 11 的 PowerShell 5.1/7 验证隔离样本清理、预算停止和日志写入，尚未完成 Windows 10/11 全流程验证。发布前须完成测试环境验证；不要把局部通过表述为搬家、分区或系统清理全部验证通过。
 
-记录保存在共享日志目录；在商店打包的代理应用内，位置为 `%LOCALAPPDATA%\Packages\<app>\LocalCache\Local\CDriveCleaner\Logs`。卸载该应用会删除这些记录，请先完成搬家的释放原件或还原。
+记录默认保存在原用户的 `%USERPROFILE%\.pc-care\Logs`，跨客户端使用同一位置，不查询客户端名称或应用包身份。宿主须支持本地 Windows PowerShell 执行与结果文件读取；远程或仅聊天客户端不能直接操作用户电脑。目录不可写、属于同步位置或路径安全检查失败时停止并解释，不提权绕过。
+
+升级前已有搬家记录时，先保留原日志目录并按原记录查询。旧版本可能使用 `%LOCALAPPDATA%\CDriveCleaner\Logs` 或某个应用的 `LocalCache\Local\CDriveCleaner\Logs`；使用已验证的旧目录，通过本次进程的 `CLEANER_LOG_PATH` 指向其中一个新的 `.jsonl` 文件，再查询原 Id，后台与管理员阶段会继承该目录。不要因为新目录查不到旧记录就重新搬家，也不要自动搬动或合并记录。没有未完成搬家时使用新默认位置。详见[体检与清理参考](references/targets.md)。

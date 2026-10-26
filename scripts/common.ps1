@@ -157,9 +157,11 @@ function Expand-CleanerPath {
     $expanded = $Pattern
     foreach ($key in $Context.Variables.psbase.Keys) {
         $token = '%' + $key + '%'
+        # Most rules contain one token; do not create a closure for every variable
+        # on every file. Escape replacement dollars so user paths stay literal.
+        if ($expanded.IndexOf($token, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
         $replacement = [string]$Context.Variables[$key]
-        $evaluator = { param($match) $replacement }.GetNewClosure()
-        $expanded = [regex]::Replace($expanded, [regex]::Escape($token), [Text.RegularExpressions.MatchEvaluator]$evaluator, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        $expanded = [regex]::Replace($expanded, [regex]::Escape($token), $replacement.Replace('$', '$$'), [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     }
     if ($expanded -match '%[^%]+%') { throw "不能展开路径占位符：$Pattern" }
     return $expanded
@@ -172,9 +174,23 @@ function ConvertTo-CleanerPatternRegex {
 
 function Test-CleanerPattern {
     param([string]$Path, [string]$Pattern, [switch]$Exact)
+    # Cache pure pattern compilation only, never path validation or file metadata.
+    # Ordinal keys preserve case-sensitive regex source; matching retains the
+    # original IgnoreCase/CultureInvariant semantics. Bound memory for long runs.
+    $cache = $ExecutionContext.SessionState.PSVariable.GetValue('script:CleanerPatternCache')
+    if ($null -eq $cache) {
+        $cache = [Collections.Generic.Dictionary[string,regex]]::new([StringComparer]::Ordinal)
+        $script:CleanerPatternCache = $cache
+    }
+    $key = [string][bool]$Exact + ':' + $Pattern
+    $matcher = $null
+    if ($cache.TryGetValue($key, [ref]$matcher)) { return $matcher.IsMatch($Path) }
     $expression = '^(?:' + (ConvertTo-CleanerPatternRegex -Pattern $Pattern) + ')'
     if ($Exact) { $expression += '$' } else { $expression += '(?:\\|$)' }
-    return [regex]::IsMatch($Path, $expression, [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant')
+    $matcher = [regex]::new($expression, [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant')
+    if ($cache.Count -ge 2048) { $cache.Clear() }
+    $cache[$key] = $matcher
+    return $matcher.IsMatch($Path)
 }
 
 function Get-CleanerRegistryValue {
@@ -331,14 +347,13 @@ function Get-CleanerPackageFamilyName {
 }
 
 function Set-CleanerContextLogPath {
-    # 单独保留默认/参数/环境优先级，便于不调用 Windows 身份 API 的测试。
+    # Client-independent default, outside AppData package virtualization.
+    # Explicit legacy locations remain supported for existing migration records.
     param($Context, [string]$LogPath)
     $diagnostic = ''
     if (-not $LogPath) { $LogPath = [Environment]::GetEnvironmentVariable('CLEANER_LOG_PATH') }
     if (-not $LogPath) {
-        $package = Get-CleanerPackageFamilyName
-        $diagnostic = $package.Error
-        $base = Get-CleanerLogBase -LocalAppData $Context.Variables.LOCALAPPDATA -PackageFamilyName $package.FamilyName
+        $base = (ConvertTo-CleanerCanonicalPath -LiteralPath $Context.OriginalUserProfile) + '\.pc-care\Logs'
         $LogPath = $base + '\cleaner-' + [guid]::NewGuid().ToString('N') + '.jsonl'
     }
     $Context.LogPath = ConvertTo-CleanerCanonicalPath -LiteralPath $LogPath
@@ -346,7 +361,7 @@ function Set-CleanerContextLogPath {
 }
 
 function Assert-CleanerLogDirectory {
-    # 只接受原用户 LocalAppData 下两种精确形状；不能借日志参数授权其他 Packages 目录。
+    # Stable per-user directory, plus the two legacy shapes for existing records.
     param([string]$LogDirectory, $Context)
     try {
         $directory = ConvertTo-CleanerCanonicalPath -LiteralPath $LogDirectory
@@ -354,7 +369,9 @@ function Assert-CleanerLogDirectory {
         $profile = ConvertTo-CleanerCanonicalPath -LiteralPath $Context.OriginalUserProfile
         if (-not $directory.StartsWith(($profile + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw '记录目录必须位于原账户的用户文件夹内。' }
         $plain = Get-CleanerLogBase $local ''
-        if (-not $directory.Equals($plain, [StringComparison]::OrdinalIgnoreCase)) {
+        $portable = $profile + '\.pc-care\Logs'
+        if (-not $directory.Equals($portable, [StringComparison]::OrdinalIgnoreCase) -and
+            -not $directory.Equals($plain, [StringComparison]::OrdinalIgnoreCase)) {
             $prefix = $local + '\Packages\'
             $suffix = '\LocalCache\Local\CDriveCleaner\Logs'
             if (-not $directory.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or
@@ -551,30 +568,68 @@ function Get-CleanerContext {
     return $context
 }
 
-function Get-CleanerForbiddenReason {
-    param([string]$LiteralPath, $Context, [string[]]$PermittedContainerRoots = @())
+function Get-CleanerForbiddenRules {
+    param($Context)
     $targets = Get-CleanerTargets
-    if ($LiteralPath.Length -le 3) { return '禁止盘符根目录。' }
+    # Snapshot only rule inputs. A changed context or policy invalidates the
+    # compiled matchers; filesystem identity and permissions are never cached.
+    $sources = @($targets.ForbiddenPaths, $targets.ProtectedRoots, $Context.SyncRoots,
+        $Context.ProtectedMachineRoots, $targets.SyncDirectoryNames, $targets.ForbiddenFilePatterns)
+    $parts = [Collections.Generic.List[string]]::new()
+    foreach ($pair in $Context.Variables.GetEnumerator()) {
+        $parts.Add([string]$pair.Key); $parts.Add([string]$pair.Value)
+    }
+    foreach ($source in $sources) {
+        $parts.Add('GROUP:' + @($source).Count)
+        foreach ($value in $source) { $parts.Add([string]$value) }
+    }
+    $builder = [Text.StringBuilder]::new()
+    foreach ($part in $parts) { [void]$builder.Append($part.Length).Append(':').Append($part) }
+    $signature = $builder.ToString()
+    $property = $Context.PSObject.Properties['CompiledForbiddenRules']
+    if ($null -ne $property -and $property.Value.Signature -ceq $signature) { return $property.Value }
+    $rules = [Collections.Generic.List[object]]::new()
+    $segments = [Collections.Generic.List[object]]::new()
+    $options = [Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
     foreach ($template in $targets.ForbiddenPaths) {
         $pattern = Expand-CleanerPath -Pattern $template -Context $Context
-        if (Test-CleanerPattern -Path $LiteralPath -Pattern $pattern) { return "永久禁止区：$template" }
+        $rules.Add(@{ Matcher = [regex]::new(('^(?:' + (ConvertTo-CleanerPatternRegex $pattern) + ')(?:\\|$)'), $options)
+            Reason = "永久禁止区：$template"; Container = $false })
     }
     foreach ($template in $targets.ProtectedRoots) {
         $pattern = Expand-CleanerPath -Pattern $template -Context $Context
-        if ((Test-CleanerPattern -Path $LiteralPath -Pattern $pattern -Exact) -and $LiteralPath -notin $PermittedContainerRoots) { return "禁止整棵目录操作：$template" }
+        $rules.Add(@{ Matcher = [regex]::new(('^(?:' + (ConvertTo-CleanerPatternRegex $pattern) + ')$'), $options)
+            Reason = "禁止整棵目录操作：$template"; Container = $true })
     }
     foreach ($syncRoot in $Context.SyncRoots) {
-        if (Test-CleanerPattern -Path $LiteralPath -Pattern $syncRoot) { return "原用户的同步根：$syncRoot" }
+        $rules.Add(@{ Matcher = [regex]::new(('^(?:' + (ConvertTo-CleanerPatternRegex $syncRoot) + ')(?:\\|$)'), $options)
+            Reason = "原用户的同步根：$syncRoot"; Container = $false })
     }
     foreach ($machineRoot in $Context.ProtectedMachineRoots) {
-        if (Test-CleanerPattern -Path $LiteralPath -Pattern $machineRoot) { return "禁止直接处理程序安装目录：$machineRoot" }
+        $rules.Add(@{ Matcher = [regex]::new(('^(?:' + (ConvertTo-CleanerPatternRegex $machineRoot) + ')(?:\\|$)'), $options)
+            Reason = "禁止直接处理程序安装目录：$machineRoot"; Container = $false })
+    }
+    foreach ($pattern in $targets.SyncDirectoryNames) {
+        $segments.Add(@{ Matcher = [regex]::new(('^(?:' + (ConvertTo-CleanerPatternRegex $pattern) + ')$'), $options); Reason = '疑似同步目录：' })
+    }
+    foreach ($pattern in $targets.ForbiddenFilePatterns) {
+        $segments.Add(@{ Matcher = [regex]::new(('^(?:' + (ConvertTo-CleanerPatternRegex $pattern) + ')$'), $options); Reason = '禁止直接处理的文件类型或用户数据：' })
+    }
+    $plan = [pscustomobject]@{ Signature = $signature; Rules = $rules.ToArray(); Segments = $segments.ToArray() }
+    $Context | Add-Member -NotePropertyName CompiledForbiddenRules -NotePropertyValue $plan -Force
+    return $plan
+}
+
+function Get-CleanerForbiddenReason {
+    param([string]$LiteralPath, $Context, [string[]]$PermittedContainerRoots = @())
+    if ($LiteralPath.Length -le 3) { return '禁止盘符根目录。' }
+    $plan = Get-CleanerForbiddenRules -Context $Context
+    foreach ($rule in $plan.Rules) {
+        if ($rule.Matcher.IsMatch($LiteralPath) -and (-not $rule.Container -or $LiteralPath -notin $PermittedContainerRoots)) { return $rule.Reason }
     }
     foreach ($segment in $LiteralPath.Substring(3).Split([char]'\')) {
-        foreach ($pattern in $targets.SyncDirectoryNames) {
-            if (Test-CleanerPattern -Path $segment -Pattern $pattern -Exact) { return "疑似同步目录：$segment" }
-        }
-        foreach ($pattern in $targets.ForbiddenFilePatterns) {
-            if (Test-CleanerPattern -Path $segment -Pattern $pattern -Exact) { return "禁止直接处理的文件类型或用户数据：$segment" }
+        foreach ($rule in $plan.Segments) {
+            if ($rule.Matcher.IsMatch($segment)) { return $rule.Reason + $segment }
         }
     }
     return $null
@@ -1418,6 +1473,7 @@ function Remove-SafeItem {
         [Parameter(Mandatory = $true)][string]$LiteralPath,
         [Parameter(Mandatory = $true)][string]$Category,
         [ValidateRange(0, 876000)][double]$MinAgeHours = 24,
+        [Nullable[DateTime]]$DeadlineUtc,
         $Context
     )
     Assert-CleanerDeletionCategory -Category $Category
@@ -1441,6 +1497,12 @@ function Remove-SafeItem {
     }
     else { $stack.Push([pscustomobject]@{ Path = $root.Path; Post = $false; IsRoot = $true }) }
     while ($stack.Count -gt 0) {
+        if ($null -ne $DeadlineUtc -and [DateTime]::UtcNow -ge $DeadlineUtc) {
+            $reason = '已达到快速清理时间预算，剩余内容保留；可稍后继续或使用完整模式。'
+            $skipped.Add([pscustomobject]@{ Path = $LiteralPath; Reason = $reason })
+            Write-CleanerAudit -Action Remove -Path $LiteralPath -Result Skipped -Message $reason -Context $Context
+            break
+        }
         $frame = $stack.Pop()
         $path = $frame.Path
         try {

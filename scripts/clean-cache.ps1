@@ -32,7 +32,10 @@ param(
     [string[]]$Category = @('UserTemp', 'WindowsTemp', 'ThumbnailCache', 'BrowserCache', 'AppCache', 'ShaderCache', 'InetCache', 'SystemLogs', 'DevCache'),
 
     [ValidateRange(0, 876000)]
-    [double]$MinAgeHours = 24
+    [double]$MinAgeHours = 24,
+
+    # Zero preserves the unbounded legacy handler; clean.ps1 selects a budget.
+    [ValidateRange(0, 3600)][int]$TimeBudgetSeconds = 0
 )
 
 if ($env:OS -ne 'Windows_NT') {
@@ -66,6 +69,9 @@ $script:CacheCleanerCmdlet = $PSCmdlet
 $script:CacheCleanerContext = Get-CleanerContext
 $script:CacheCleanerSummary = [ordered]@{}
 $script:CacheCleanerBlockedApps = @{}
+$script:CacheCleanerDeadlineUtc = $null
+if ($TimeBudgetSeconds -gt 0) { $script:CacheCleanerDeadlineUtc = [DateTime]::UtcNow.AddSeconds($TimeBudgetSeconds) }
+$script:CacheCleanerBudgetReported = @{}
 $script:CacheCleanerLogPath = Get-CacheResultField $script:CacheCleanerContext @('LogPath', 'LogFilePath') '共享日志'
 $cacheUserProfile = Get-CacheResultField $script:CacheCleanerContext @('OriginalUserProfile', 'UserProfile', 'UserProfilePath', 'OriginalProfilePath')
 if ([string]::IsNullOrWhiteSpace([string]$cacheUserProfile)) {
@@ -125,6 +131,7 @@ function Add-CacheSkip {
 
 function Remove-CacheTarget {
     param([string]$Name, [string]$LiteralPath, [string[]]$ProcessNames = @(), [string]$App)
+    if (Test-CacheTimeBudget -Name $Name -LiteralPath $LiteralPath) { return }
     $effectiveMinAgeHours = $MinAgeHours
     if ($Name -eq 'SystemLogs') { $effectiveMinAgeHours = [Math]::Max([double]168, $MinAgeHours) }
     try {
@@ -140,7 +147,10 @@ function Remove-CacheTarget {
         }
         # 确认后再检查应用状态；不终止进程，状态变化时保留该应用余下的目标。
         if ($ProcessNames.Count -gt 0 -and -not (Test-CacheAppStopped $Name $ProcessNames $LiteralPath $App)) { return }
-        $results = @(Remove-SafeItem -LiteralPath $LiteralPath -Category $Name -MinAgeHours $effectiveMinAgeHours -Context $script:CacheCleanerContext -Confirm:$false -ErrorAction Stop)
+        $budgetArguments = @{}
+        $deadline = $ExecutionContext.SessionState.PSVariable.GetValue('script:CacheCleanerDeadlineUtc')
+        if ($null -ne $deadline) { $budgetArguments.DeadlineUtc = $deadline }
+        $results = @(Remove-SafeItem -LiteralPath $LiteralPath -Category $Name -MinAgeHours $effectiveMinAgeHours -Context $script:CacheCleanerContext -Confirm:$false -ErrorAction Stop @budgetArguments)
         if ($results.Count -eq 0) {
             Add-CacheSkip $Name $LiteralPath '共享删除函数未返回结果，释放量未知；请检查共享日志'
             return
@@ -173,6 +183,17 @@ function Remove-CacheTarget {
     }
 }
 
+function Test-CacheTimeBudget {
+    param([string]$Name, [string]$LiteralPath)
+    $deadline = $ExecutionContext.SessionState.PSVariable.GetValue('script:CacheCleanerDeadlineUtc')
+    if ($null -eq $deadline -or [DateTime]::UtcNow -lt $deadline) { return $false }
+    if (-not $script:CacheCleanerBudgetReported.ContainsKey($Name)) {
+        $script:CacheCleanerBudgetReported[$Name] = $true
+        Add-CacheSkip $Name $LiteralPath '已达到快速清理时间预算，剩余内容保留；可稍后继续或使用完整模式。' -Quiet
+    }
+    return $true
+}
+
 function Remove-CacheDirectoryChildren {
     param([string]$Name, [string]$LiteralPath, [string]$Filter)
     try {
@@ -191,6 +212,11 @@ function Remove-CacheDirectoryChildren {
                 Add-CacheSkip $Name $LiteralPath ([string]$reason)
                 return
             }
+            # One shared traversal preserves the actual whitelist root. The old
+            # per-child calls treated every temporary subdirectory as a root,
+            # repeatedly validating it and retaining thousands of empty roots.
+            Remove-CacheTarget $Name $LiteralPath
+            return
         }
         # 缩略图白名单可以仅允许匹配文件，不要求 Explorer 父目录可被删除。
         $arguments = @{ LiteralPath = $LiteralPath; Force = $true; ErrorAction = 'Stop' }
@@ -200,6 +226,7 @@ function Remove-CacheDirectoryChildren {
         }
         # 不递归枚举；每个子项由 Remove-SafeItem 再次校验后处理。
         foreach ($item in @(Get-ChildItem @arguments)) {
+            if (Test-CacheTimeBudget -Name $Name -LiteralPath $LiteralPath) { break }
             Remove-CacheTarget $Name $item.FullName
         }
     }
