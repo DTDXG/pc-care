@@ -100,8 +100,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\move.
 powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\partition.ps1" -Plan
 ```
 
-1. 读取 `pc-care/partition-plan/1`。向用户用人话展示 `Summary`、`Before/After` 大小变化和 `Warnings`；提醒先备份，同一硬盘不同分区不算备份。`Feasible=false` 则解释 `Blockers` 并停止。
-2. 用户要调整用途或盘数时，由 AI 构造 `-Layout` 的布局 JSON 重新规划；不把 JSON 或参数给用户选择。已有合适数据盘时通常直接搬家。
+1. 读取 `pc-care/partition-plan/1`。向用户用人话展示 `Summary`、`Before/After` 大小变化和 `Warnings`；提醒先备份，同一硬盘不同分区不算备份。`Feasible=false` 则解释 `Blockers` 并停止；`Feasible=true` 也须核对 `Actionable` 和 `Mode`，不代表有可执行修改。
+2. 规划目标和容量时先读 [按整理目标规划](references/goal-planning.md)。结合有效体检确认要搬的项目、准确大小和目标盘容量，使用布局中的 `MigrationItems` 提供目标估算；它只影响建议，不构成搬家或删除授权。读取 `CapacityAssessment` 区分保留空间策略、Windows 可压缩限制和未知状态，读取 `MigrationAssessment` 区分可全部搬、只能部分搬、没有完整项目能装下及大小未知。不得预支释放原件后的空间，也不承诺之后扩容 D 盘。
+
+   用户要调整用途或盘数时，由 AI 构造 `-Layout` 的布局 JSON 重新规划；不把 JSON 或参数给用户选择。已有合适数据盘时通常直接搬家。
 3. `PendingChecks` 是执行前待验证项，不能说已通过，也不为补检查而先提权。执行时脚本会验证；失败须遵从结果。
 4. `RequiresRecoveryKeyConfirmation=true`：展示 `RecoveryKeyHint`，补充可在 https://aka.ms/myrecoverykey、打印件、U 盘或保存的文件中找恢复密钥；请用户在聊天中确认能找到。不要要求发送密钥本身，也不代替用户确认。
 5. 展示最终方案后，必须得到第二次明确的聊天确认才运行下列执行指令；“想分区”或“帮我看看”不算。恢复密钥确认可与方案二次确认在同一条回复里完成，但两者都须明确。
@@ -125,7 +127,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<skill目录>\scripts\parti
 - 体检后保留 NextStep 主推荐，仍须过本节门槛；用户先做清理时，清理结束后重新核对并承接尚未处理的主推荐，不因之前提过而省略。NextStep=none 且无其他符合门槛的后续操作时，说明暂无可处理项并结束。
 - Totals.SafeBytes>0 才给“回复‘清理’”；Group=confirm 项展示 Loss 后只给点名回复，如“回复‘清空回收站’”，笼统的“清理”不算点名，只有确认项时不推荐空跑。
 - 搬家须有尚未处理的 Group=move 项，且 DataVolumes 中有非 C:、IsFixed=true、FileSystem=NTFS、FreeBytes≥该项 Bytes×1.1 的卷；拟推荐搬家但该项 IsLowerBound=true 时，先建议“重新体检”。该大小下限不阻止无合适数据盘时先建议分区规划，规划会独立检查容量和布局。未完成记录先按第3节处理，后续均沿用此门槛，搬家后须用新体检核实余量，不复用搬前空闲量。
-- 有效体检结果显示无合适数据卷且存在文件整理需求（如尚未处理的搬家项目），或 NextStep=partition 时，建议评估分区，给“回复‘分区规划’，只出方案，不动硬盘”，等用户回复才运行 Plan。磁盘信息未知时先重新体检，不把未检测到数据盘断言为只有 C 盘。Feasible=false 时解释 Blockers 并停止，不再重复推荐同一方案；仅 Feasible=true 且 Mode=Create/Shrink 才可进入第4节执行确认；Mode=None 按 Situation/Summary 说明，不称可新建分区。
+- 有效体检结果显示无合适数据卷且存在文件整理需求（如尚未处理的搬家项目），或 NextStep=partition 时，建议评估分区，给“回复‘分区规划’，只出方案，不动硬盘”，等用户回复才运行 Plan。磁盘信息未知时先重新体检，不把未检测到数据盘断言为只有 C 盘。Feasible=false 时解释 Blockers 并停止，不再重复推荐同一方案；仅 Feasible=true 且 Mode=Create/Shrink 才可进入第4节执行确认；Mode=None 按 Situation/Summary 和 CapacityAssessment 说明，不称可新建分区；“当前策略不允许”不等于“Windows 技术上不可行”，不得仅因此认定必须加硬盘。
 - 已确认只有 C 盘且有整理需求时，简短说明可评估划出数据分区（如 D 盘），用于个人文件和以后安装的应用，便于分开管理系统、应用和数据。先检查可行性、展示容量方案并取得执行确认，再逐项安排文件搬家；盘符和容量以方案为准。现有软件不能直接搬安装目录，本技能不执行软件迁移或重装。分区本身不释放已用空间，同盘分区也不算备份；不把分区说成必需或承诺一定可行。
 - 快速清理后，仅 Mode=Quick、至少一个 Items[].Reason 包含“快速清理已到时间预算”且体检报告仍有效时，才给“回复‘完整清理’”；不凭 Partial/Skipped 推断，必须等用户回复，不自动重跑或扩大已确认范围。
 - 清理后，先报告本次 FreedBytes 估算和 FreeAfter 所示 C 盘剩余空间，未知就说未知，再依据有效体检结果选择下一步：有通过搬家门槛的项目，说明“预计试用后删除原件可腾出约 X GB”并给“回复‘搬家’”；否则符合上文分区规划条件且用户未拒绝时，承接分区规划建议，不能仅因没有可搬家的数据盘就结束。报告失效时只建议重新体检；拟推荐搬家但大小仅为下限时也先重新体检。符合快速清理续跑条件时可建议“完整清理”，已有主推荐时作为第二个选项。没有符合条件的后续操作时，说明目前无需进一步处理并结束。未完成搬家或分区异常优先按各自状态规则处理。

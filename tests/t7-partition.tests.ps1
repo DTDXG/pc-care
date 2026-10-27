@@ -85,8 +85,19 @@ Assert-Equal $p.NewVolumes[0].Offset 17MB '为 Windows 自动保留分区让出�
 $s = New-TestState; $s.CUsedBytes = 430GB; $p = New-PcPartitionPlan $s
 Assert-Equal $p.Situation 'InsufficientSpace' '空间不足不分区'
 Assert-Equal @($p.NewVolumes).Count 0 '不足不创建小分区'
-Assert-True ($p.Summary -match '清理.*移动硬盘') '不足时建议清理和外部磁盘'
+Assert-True ($p.Summary -match '当前规则.*不修改') '不足时区分策略限制并保持布局'
 
+# 整理目标随方案输出；估算不改变现有执行保留线。
+$s = New-TestState
+$p = New-PcPartitionPlan $s '{"Volumes":[{"Label":"资料","SizeGB":40}],"MigrationItems":[{"Id":"move:KnownFolder:Downloads","Bytes":10737418240,"IsLowerBound":false},{"Id":"move:KnownFolder:Desktop","Bytes":42949672960,"IsLowerBound":false}]}'
+Assert-Equal $p.MigrationAssessment.Status 'Partial' '目标估算随规划输出部分搬家'
+Assert-True $p.Actionable '可执行布局与目标是否装下分别表达'
+Assert-Equal $p.NextStep 'confirm-plan' '分区前不能直接进入搬家'
+Assert-True (Test-PcFrozenPlan $p $s).Valid '建议估算保持执行校验兼容'
+$s.CUsedBytes = 430GB; $p = New-PcPartitionPlan $s
+Assert-True (-not $p.Actionable) '无操作方案不可执行'
+Assert-Equal $p.CapacityAssessment.LimitingFactor 'ReservePolicy' '无操作方案仍解释策略限制'
+Assert-Equal $p.NextStep 'review-capacity' '无目标盘不推荐搬家'
 # 保留量、Windows 可压缩量、推荐边界及布局校验。
 Assert-Equal (Get-PcReserve 10GB) 120GB '最低保留 120 GB'
 Assert-Equal (Get-PcReserve 100GB) 160GB '已用加 60 GB'

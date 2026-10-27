@@ -1,4 +1,4 @@
-# pc-care
+﻿# pc-care
 
 pc-care 是面向普通中文 Windows 10 / 11 用户的电脑空间保养 skill。用户说“C 盘满了”“把文件搬到 D 盘”“想分区”，AI 负责检查、解释和执行；用户只在聊天里确认，并在系统权限提示出现时点“是”，无需复制命令。
 
@@ -76,3 +76,7 @@ git diff --check
 测试只从语法树加载逻辑函数并模拟系统状态，不执行脚本的 Windows 主体；上述命令已包含 `tests/t6-move.tests.ps1`。
 
 Windows 原生隔离测试另行运行 `tests/t10-windows-smoke.ps1 -FixtureParent <已存在的测试目录绝对路径>`。它只创建、处理本次生成的样本，保留近期/只读/白名单外样本供检查，不扫描真实缓存；默认记录目录会新增一条自检日志。分别用 Windows PowerShell 5.1 和 PowerShell 7 验证。
+
+## 按整理目标规划
+
+分区结果提供策略与 Windows 可压缩限制的独立说明，并可通过布局 MigrationItems 估算新数据盘能容纳全部还是部分目标。估算仅供方案解释，不授权分区或搬家；分区后仍需重新体检。默认保留策略未放宽，不支持后续移动或扩容已有分区。详见 [规划参考](references/goal-planning.md)。

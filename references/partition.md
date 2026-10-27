@@ -1,4 +1,4 @@
-# 分区与加密规则
+﻿# 分区与加密规则
 
 [partition.ps1](../scripts/partition.ps1) 先只读规划，收到用户对最终方案的第二次明确聊天确认后才执行。所有调用由 AI 完成，用户无需复制命令。总体流程见 [SKILL.md](../SKILL.md)。
 
@@ -54,3 +54,7 @@
 - `Failed`、管理员结果缺失或不确定是否已修改：保留日志，先重新 Plan 并核实当前布局，再展示新方案、重新确认；绝不直接重跑 Apply、自动删除新分区或重新格式化。
 
 WhatIf 不写文件、不提权、不启动外部工具。Apply 演练只读已有方案并在 stdout 给预览 JSON，`RESULT:` 指向原输入方案，不是实际执行结果，也不代表实时检查通过。
+
+## 整理目标与限制解释
+
+按 [按整理目标规划](goal-planning.md) 将目标项目与容量相匹配。布局可含 MigrationItems；结果新增 CapacityAssessment、MigrationAssessment 和 Actionable。只有 Actionable=true 且 Mode=Create/Shrink 才有可执行分区修改；Feasible=true、Mode=None 仍表示不改盘。现有 60 GB 余量规则是技能策略，不等于 Windows 技术极限。不要把分阶段搬家说成支持之后自动扩容。

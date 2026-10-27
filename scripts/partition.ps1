@@ -65,6 +65,72 @@ function Get-PcUsable {
     return Get-PcAligned $available
 }
 
+function Get-PcCapacityAssessment {
+    param([long]$CSize, $UsedBytes, $MaxShrinkBytes)
+    $policy = $null; $reserve = $null; $limit = 'Unknown'
+    if ($null -ne $UsedBytes) {
+        $reserve = Get-PcReserve ([long]$UsedBytes)
+        $policy = Get-PcAligned ([long][math]::Max([long]0, [long]($CSize - $reserve)))
+        if ($null -eq $MaxShrinkBytes) { $limit = 'WindowsLimitUnknown' }
+        elseif ($policy -lt $MaxShrinkBytes) { $limit = 'ReservePolicy' }
+        elseif ($policy -gt $MaxShrinkBytes) { $limit = 'WindowsShrinkLimit' }
+        else { $limit = 'Both' }
+    }
+    return [pscustomobject]@{ RequiredCBytes = $reserve; PolicyUsableBytes = $policy
+        WindowsMaxShrinkBytes = $MaxShrinkBytes; LimitingFactor = $limit
+        MinimumNewVolumeBytes = [long]20GB; ReservePolicy = 'UsedPlus60GBAndMinimum120GB' }
+}
+
+function Get-PcMigrationAssessment {
+    # Advisory only: these estimates never authorize copying, deleting or resizing.
+    param([object[]]$Items, [object[]]$NewVolumes)
+    $result = [pscustomobject]@{ Status = 'NoTargets'; RequiredBytes = $null; CapacityBytes = [long]0
+        ShortfallBytes = $null; Assignments = @(); RemainingIds = @(); Issues = @()
+        ConservativeFit = $true; GrowthMarginPercent = 10; CountsFutureSourceRelease = $false }
+    if ($Items.Count -eq 0) { return $result }
+    $ids = @{}; [decimal]$sum = 0; $valid = @()
+    foreach ($item in $Items) {
+        $id = [string](Get-PcValue $item 'Id' '')
+        $bytes = Get-PcValue $item 'Bytes'
+        $lower = Get-PcValue $item 'IsLowerBound'
+        if ($id -notmatch '^move:(KnownFolder:(Desktop|Documents|Downloads|Pictures|Videos)|WeChat|QQ)$' -or
+            $ids.ContainsKey($id) -or ($bytes -isnot [long] -and $bytes -isnot [int]) -or $bytes -le 0 -or
+            $lower -isnot [bool] -or $lower) {
+            $result.Status = 'SizeUnknown'; $result.Issues = @('目标项目缺少可靠大小、存在重复或仅为下限，请重新核实；不能保证能搬入。'); return $result
+        }
+        $ids[$id] = $true
+        [decimal]$need = [math]::Ceiling([decimal]$bytes * [decimal]1.1)
+        $sum += $need
+        if ($sum -gt [long]::MaxValue) { $result.Status = 'SizeUnknown'; $result.Issues = @('目标数据量超出可计算范围。'); return $result }
+        $valid += [pscustomobject]@{ Id = $id; RequiredBytes = [long]$need }
+    }
+    $result.RequiredBytes = [long]$sum
+    $bins = @()
+    foreach ($volume in $NewVolumes) {
+        $size = Get-PcValue $volume 'Size'
+        if (($size -is [long] -or $size -is [int]) -and $size -gt 0) {
+            $bins += [pscustomobject]@{ Letter = $volume.DriveLetter; Remaining = [decimal]$size }
+        }
+    }
+    [decimal]$capacity = 0; foreach ($bin in $bins) { $capacity += $bin.Remaining }
+    $result.CapacityBytes = [long][math]::Min([decimal][long]::MaxValue, $capacity)
+    $result.ShortfallBytes = [long][math]::Max([decimal]0, [decimal]($sum - $capacity))
+    foreach ($item in @($valid | Sort-Object RequiredBytes -Descending)) {
+        $fit = @($bins | Where-Object { $_.Remaining -ge $item.RequiredBytes } | Sort-Object Remaining)
+        if ($fit.Count -eq 0) { $result.RemainingIds += $item.Id; continue }
+        $fit[0].Remaining -= $item.RequiredBytes
+        $result.Assignments += [pscustomobject]@{ Id = $item.Id; DriveLetter = $fit[0].Letter; RequiredBytes = $item.RequiredBytes }
+    }
+    if ($bins.Count -eq 0) { $result.Status = 'NoDestination' }
+    elseif ($result.RemainingIds.Count -eq 0) { $result.Status = 'Full' }
+    elseif ($result.Assignments.Count -gt 0) { $result.Status = 'Partial' }
+    else { $result.Status = 'NoFit' }
+    if ($result.RemainingIds.Count -gt 0) {
+        $result.Issues = @('当前保守分配未能容纳所有完整项目；总容量差额不代表单个项目能装入。不得承诺以后扩容已有分区。')
+    }
+    return $result
+}
+
 function Test-PcInternalDisk {
     param($Disk)
     return (-not [bool](Get-PcValue $Disk 'IsRemovable' $false) -and
@@ -381,9 +447,9 @@ function New-PcPartitionPlan {
             $mappings += [pscustomobject]@{ DiskNumber = $data[$i].DiskNumber; DriveLetter = $data[$i].DriveLetter; Purpose = $purpose; Folders = @(Get-PcDefaultFolders $purpose) }
         }
     }
-    if ($situation -eq 'InsufficientSpace') { $warnings += '现有空间不足，不分区；建议先清理 C 盘，仍不足时加装硬盘或使用移动硬盘。' }
+    if ($situation -eq 'InsufficientSpace') { $warnings += '当前保留空间策略和可压缩范围内不足以新建至少 20 GB 的数据分区；这不等于 Windows 一定无法分区。先核实限制和目标数据量，不反复清理或自动降低保留线。' }
     $summary = '已有数据分区，保留现有布局，按用途整理后即可搬家。'
-    if ($situation -eq 'InsufficientSpace') { $summary = '空间不足，先清理 C 盘；仍不够时建议加装硬盘或使用移动硬盘。' }
+    if ($situation -eq 'InsufficientSpace') { $summary = '当前规则下可划出的空间不足，不修改分区；需结合容量限制和搬家目标评估外部中转或增加硬盘。' }
     if ($new.Count -gt 0) {
         $descriptions = @($new | ForEach-Object { '{0} 盘 {1:0.#} GB（{2}）' -f $_.DriveLetter, ($_.Size / 1GB), $_.Label }) -join '、'
         $summary = '在硬盘 ' + $disk.Number + ' 的空闲空间新增 ' + $descriptions + '。'
@@ -397,9 +463,12 @@ function New-PcPartitionPlan {
         Fingerprint = Get-PcFingerprint $State $disk.Number; Situation = $situation; Mode = $mode; Feasible = ($blockers.Count -eq 0); NeedsElevatedRead = ($pending.Count -gt 0)
         Blockers = @($blockers | Select-Object -Unique); PendingChecks = @($pending | Select-Object -Unique); Warnings = @($warnings | Select-Object -Unique)
         Before = @($before); After = @($after); CAfterBytes = $cAfter; NewVolumes = @($new); PurposeMappings = @($mappings)
+        CapacityAssessment = (Get-PcCapacityAssessment $c.Size $State.CUsedBytes $State.MaxShrinkBytes)
+        MigrationAssessment = (Get-PcMigrationAssessment @(Get-PcValue $request 'MigrationItems' @()) @($new))
+        Actionable = ($mode -ne 'None' -and $blockers.Count -eq 0)
         UsableBytes = $usable; Summary = $summary; RequiresSecondChatConfirmation = $true
         RequiresRecoveryKeyConfirmation = ($mode -eq 'Shrink' -and $State.BitLocker -in @('FullyEncrypted', 'Unknown')); RecoveryKeyHint = $recoveryKeyHint
-        NextStep = 'move'; Advice = '分区完成后可按目录安排搬家；以后安装软件时请选择软件盘。' }
+        NextStep = $(if ($mode -ne 'None' -and $blockers.Count -eq 0) { 'confirm-plan' } elseif ($situation -eq 'ExistingData') { 'check-move-capacity' } else { 'review-capacity' }); Advice = '先核实目标容量；实际分区成功并重新体检后，才逐项确认搬家。不得预支原件释放收益或承诺自动扩容数据盘。' }
 }
 
 function Test-PcOverlap {
